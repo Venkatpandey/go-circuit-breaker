@@ -211,3 +211,25 @@ func (cb *CircuitBreaker) ForceClose() {
 	cb.state = StateClosed
 	cb.resetCounts()
 }
+
+func (cb *CircuitBreaker) RestoreState(state State, failureCount, successCount int, lastFailureTime time.Time) error {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	if state < StateClosed || state > StateHalfOpen {
+		return ErrInvalidState
+	}
+
+	cb.state = state
+	cb.failureCount = failureCount
+	cb.successCount = successCount
+	cb.lastFailureTime = lastFailureTime
+
+	return nil
+}
+
+func (cb *CircuitBreaker) GetConfiguration() (int, int, time.Duration, time.Duration) {
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
+	return cb.failureThreshold, cb.successThreshold, cb.timeout, cb.cooldownPeriod
+}
