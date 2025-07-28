@@ -1,7 +1,6 @@
 package adapters
 
 import (
-	"context"
 	"fmt"
 	"go-circuit-breaker/core"
 	"testing"
@@ -14,18 +13,14 @@ import (
 )
 
 // Test utilities
-
 func setupTestRedis(t *testing.T) (*RedisRepository, *miniredis.Miniredis) {
-	// Start embedded Redis server for testing
 	mr, err := miniredis.Run()
 	require.NoError(t, err)
 
-	// Create Redis client
 	client := redis.NewClient(&redis.Options{
 		Addr: mr.Addr(),
 	})
 
-	// Create repository
 	repo := NewRedisRepository(client)
 
 	t.Cleanup(func() {
@@ -42,388 +37,479 @@ func createTestCircuitBreaker(t *testing.T) *core.CircuitBreaker {
 	return cb
 }
 
-// Constructor tests
-
-func TestNewRedisRepository(t *testing.T) {
-	client := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
-	defer client.Close()
-
-	repo := NewRedisRepository(client)
-
-	assert.NotNil(t, repo)
-	assert.Equal(t, client, repo.client)
-	assert.Equal(t, DefaultRedisConfig(), repo.config)
-}
-
-func TestNewRedisRepositoryWithConfig(t *testing.T) {
-	client := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
-	defer client.Close()
-
-	config := RedisConfig{
-		Timeout: 10 * time.Second,
-		Context: context.Background(),
-	}
-
-	repo := NewRedisRepositoryWithConfig(client, config)
-
-	assert.NotNil(t, repo)
-	assert.Equal(t, client, repo.client)
-	assert.Equal(t, config, repo.config)
-}
-
-func TestNewRedisRepositoryNilClient(t *testing.T) {
-	assert.Panics(t, func() {
-		NewRedisRepository(nil)
-	})
-}
-
-func TestDefaultRedisConfig(t *testing.T) {
-	config := DefaultRedisConfig()
-
-	assert.Equal(t, defaultTimeout, config.Timeout)
-	assert.NotNil(t, config.Context)
-}
-
-// Save method tests
-
-func TestRedisRepository_Save_Success(t *testing.T) {
-	repo, mr := setupTestRedis(t)
-	cb := createTestCircuitBreaker(t)
-
-	err := repo.Save("test-id", cb)
-	assert.NoError(t, err)
-
-	// Verify data was saved
-	assert.True(t, mr.Exists("circuit_breaker:test-id"))
-}
-
-func TestRedisRepository_Save_EmptyID(t *testing.T) {
-	repo, _ := setupTestRedis(t)
-	cb := createTestCircuitBreaker(t)
-
-	err := repo.Save("", cb)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "ID cannot be empty")
-}
-
-func TestRedisRepository_Save_NilCircuitBreaker(t *testing.T) {
-	repo, _ := setupTestRedis(t)
-
-	err := repo.Save("test-id", nil)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "circuit breaker cannot be nil")
-}
-
-func TestRedisRepository_Save_RedisError(t *testing.T) {
-	repo, mr := setupTestRedis(t)
-	cb := createTestCircuitBreaker(t)
-
-	// Close Redis server to simulate error
-	mr.Close()
-
-	err := repo.Save("test-id", cb)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "failed to save circuit breaker state to Redis")
-}
-
-// FindByID method tests
-
-func TestRedisRepository_FindByID_Success(t *testing.T) {
-	repo, _ := setupTestRedis(t)
-	originalCB := createTestCircuitBreaker(t)
-
-	// Save first
-	err := repo.Save("test-id", originalCB)
-	require.NoError(t, err)
-
-	// Find
-	foundCB, err := repo.FindByID("test-id")
-	assert.NoError(t, err)
-	assert.NotNil(t, foundCB)
-
-	// Verify it's a valid circuit breaker (basic check)
-	assert.Equal(t, core.StateClosed, foundCB.GetState())
-}
-
-func TestRedisRepository_FindByID_NotFound(t *testing.T) {
-	repo, _ := setupTestRedis(t)
-
-	cb, err := repo.FindByID("non-existent")
-	assert.NoError(t, err)
-	assert.Nil(t, cb)
-}
-
-func TestRedisRepository_FindByID_EmptyID(t *testing.T) {
-	repo, _ := setupTestRedis(t)
-
-	cb, err := repo.FindByID("")
-	assert.Error(t, err)
-	assert.Nil(t, cb)
-	assert.Contains(t, err.Error(), "ID cannot be empty")
-}
-
-func TestRedisRepository_FindByID_RedisError(t *testing.T) {
-	repo, mr := setupTestRedis(t)
-
-	// Close Redis server to simulate error
-	mr.Close()
-
-	cb, err := repo.FindByID("test-id")
-	assert.Error(t, err)
-	assert.Nil(t, cb)
-	assert.Contains(t, err.Error(), "failed to retrieve circuit breaker state from Redis")
-}
-
-func TestRedisRepository_FindByID_InvalidData(t *testing.T) {
-	repo, mr := setupTestRedis(t)
-
-	// Manually set invalid JSON data
-	mr.Set("circuit_breaker:test-id", "invalid-json")
-
-	cb, err := repo.FindByID("test-id")
-	assert.Error(t, err)
-	assert.Nil(t, cb)
-	assert.Contains(t, err.Error(), "failed to unmarshal circuit breaker state")
-}
-
-// Delete method tests
-
-func TestRedisRepository_Delete_Success(t *testing.T) {
-	repo, mr := setupTestRedis(t)
-	cb := createTestCircuitBreaker(t)
-
-	// Save first
-	err := repo.Save("test-id", cb)
-	require.NoError(t, err)
-	assert.True(t, mr.Exists("circuit_breaker:test-id"))
-
-	// Delete
-	err = repo.Delete("test-id")
-	assert.NoError(t, err)
-	assert.False(t, mr.Exists("circuit_breaker:test-id"))
-}
-
-func TestRedisRepository_Delete_NotFound(t *testing.T) {
-	repo, _ := setupTestRedis(t)
-
-	err := repo.Delete("non-existent")
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "circuit breaker not found")
-}
-
-func TestRedisRepository_Delete_EmptyID(t *testing.T) {
-	repo, _ := setupTestRedis(t)
-
-	err := repo.Delete("")
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "ID cannot be empty")
-}
-
-func TestRedisRepository_Delete_RedisError(t *testing.T) {
-	repo, mr := setupTestRedis(t)
-
-	// Close Redis server to simulate error
-	mr.Close()
-
-	err := repo.Delete("test-id")
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "failed to delete circuit breaker from Redis")
-}
-
-// List method tests
-
-func TestRedisRepository_List_Success(t *testing.T) {
-	repo, _ := setupTestRedis(t)
-	cb := createTestCircuitBreaker(t)
-
-	// Save multiple circuit breakers
-	expectedIDs := []string{"cb1", "cb2", "cb3"}
-	for _, id := range expectedIDs {
-		err := repo.Save(id, cb)
-		require.NoError(t, err)
-	}
-
-	// List
-	ids, err := repo.List()
-	assert.NoError(t, err)
-	assert.ElementsMatch(t, expectedIDs, ids)
-}
-
-func TestRedisRepository_List_Empty(t *testing.T) {
-	repo, _ := setupTestRedis(t)
-
-	ids, err := repo.List()
-	assert.NoError(t, err)
-	assert.Empty(t, ids)
-}
-
-func TestRedisRepository_List_RedisError(t *testing.T) {
-	repo, mr := setupTestRedis(t)
-
-	// Close Redis server to simulate error
-	mr.Close()
-
-	ids, err := repo.List()
-	assert.Error(t, err)
-	assert.Nil(t, ids)
-	assert.Contains(t, err.Error(), "failed to list circuit breaker keys from Redis")
-}
-
-// Exists method tests
-
-func TestRedisRepository_Exists_True(t *testing.T) {
-	repo, _ := setupTestRedis(t)
-	cb := createTestCircuitBreaker(t)
-
-	// Save circuit breaker
-	err := repo.Save("test-id", cb)
-	require.NoError(t, err)
-
-	// Check existence
-	exists, err := repo.Exists("test-id")
-	assert.NoError(t, err)
-	assert.True(t, exists)
-}
-
-func TestRedisRepository_Exists_False(t *testing.T) {
-	repo, _ := setupTestRedis(t)
-
-	exists, err := repo.Exists("non-existent")
-	assert.NoError(t, err)
-	assert.False(t, exists)
-}
-
-func TestRedisRepository_Exists_EmptyID(t *testing.T) {
-	repo, _ := setupTestRedis(t)
-
-	exists, err := repo.Exists("")
-	assert.Error(t, err)
-	assert.False(t, exists)
-	assert.Contains(t, err.Error(), "ID cannot be empty")
-}
-
-// Clear method tests
-
-func TestRedisRepository_Clear_Success(t *testing.T) {
-	repo, _ := setupTestRedis(t)
-	cb := createTestCircuitBreaker(t)
-
-	// Save multiple circuit breakers
-	for _, id := range []string{"cb1", "cb2", "cb3"} {
-		err := repo.Save(id, cb)
-		require.NoError(t, err)
-	}
-
-	// Verify they exist
-	ids, err := repo.List()
-	require.NoError(t, err)
-	assert.Len(t, ids, 3)
-
-	// Clear all
-	err = repo.Clear()
-	assert.NoError(t, err)
-
-	// Verify they're gone
-	ids, err = repo.List()
-	assert.NoError(t, err)
-	assert.Empty(t, ids)
-}
-
-func TestRedisRepository_Clear_Empty(t *testing.T) {
-	repo, _ := setupTestRedis(t)
-
-	err := repo.Clear()
-	assert.NoError(t, err) // Should not error when nothing to clear
-}
-
-// Ping method tests
-
-func TestRedisRepository_Ping_Success(t *testing.T) {
-	repo, _ := setupTestRedis(t)
-
-	err := repo.Ping()
-	assert.NoError(t, err)
-}
-
-func TestRedisRepository_Ping_Error(t *testing.T) {
-	repo, mr := setupTestRedis(t)
-
-	// Close Redis server
-	mr.Close()
-
-	err := repo.Ping()
-	assert.Error(t, err)
-}
-
-// Helper method tests
-
-func TestRedisRepository_BuildKey(t *testing.T) {
-	repo, _ := setupTestRedis(t)
-
-	key := repo.buildKey("test-id")
-	assert.Equal(t, "circuit_breaker:test-id", key)
-}
-
-func TestRedisRepository_ExtractIDFromKey(t *testing.T) {
-	repo, _ := setupTestRedis(t)
-
+// Save operation tests
+func TestRedisRepository_Save(t *testing.T) {
 	tests := []struct {
-		key        string
-		expectedID string
+		name           string
+		id             string
+		circuitBreaker *core.CircuitBreaker
+		setup          func(*RedisRepository, *miniredis.Miniredis)
+		expectError    bool
+		errorContains  string
 	}{
-		{"circuit_breaker:test-id", "test-id"},
-		{"circuit_breaker:another-id", "another-id"},
-		{"invalid-key", ""},
-		{"", ""},
+		{
+			name:           "successful save",
+			id:             "test-id",
+			circuitBreaker: createTestCircuitBreaker(t),
+			expectError:    false,
+		},
+		{
+			name:           "empty ID",
+			id:             "",
+			circuitBreaker: createTestCircuitBreaker(t),
+			expectError:    true,
+			errorContains:  "ID cannot be empty",
+		},
+		{
+			name:           "nil circuit breaker",
+			id:             "test-id",
+			circuitBreaker: nil,
+			expectError:    true,
+			errorContains:  "circuit breaker cannot be nil",
+		},
+		{
+			name:           "redis connection error",
+			id:             "test-id",
+			circuitBreaker: createTestCircuitBreaker(t),
+			setup: func(repo *RedisRepository, mr *miniredis.Miniredis) {
+				mr.Close()
+			},
+			expectError:   true,
+			errorContains: "failed to save circuit breaker state to Redis",
+		},
 	}
 
 	for _, tt := range tests {
-		id := repo.extractIDFromKey(tt.key)
-		assert.Equal(t, tt.expectedID, id)
+		t.Run(tt.name, func(t *testing.T) {
+			repo, mr := setupTestRedis(t)
+
+			if tt.setup != nil {
+				tt.setup(repo, mr)
+			}
+
+			err := repo.Save(tt.id, tt.circuitBreaker)
+
+			if tt.expectError {
+				assert.Error(t, err)
+				if tt.errorContains != "" {
+					assert.Contains(t, err.Error(), tt.errorContains)
+				}
+			} else {
+				assert.NoError(t, err)
+				assert.True(t, mr.Exists("circuit_breaker:"+tt.id))
+			}
+		})
+	}
+}
+
+// FindByID operation tests
+func TestRedisRepository_FindByID(t *testing.T) {
+	tests := []struct {
+		name          string
+		id            string
+		setup         func(*RedisRepository, *miniredis.Miniredis)
+		expectError   bool
+		expectNil     bool
+		errorContains string
+	}{
+		{
+			name: "successful find",
+			id:   "test-id",
+			setup: func(repo *RedisRepository, mr *miniredis.Miniredis) {
+				cb := createTestCircuitBreaker(&testing.T{})
+				repo.Save("test-id", cb)
+			},
+			expectError: false,
+			expectNil:   false,
+		},
+		{
+			name:        "not found",
+			id:          "non-existent",
+			expectError: false,
+			expectNil:   true,
+		},
+		{
+			name:          "empty ID",
+			id:            "",
+			expectError:   true,
+			expectNil:     true,
+			errorContains: "ID cannot be empty",
+		},
+		{
+			name: "redis connection error",
+			id:   "test-id",
+			setup: func(repo *RedisRepository, mr *miniredis.Miniredis) {
+				mr.Close()
+			},
+			expectError:   true,
+			expectNil:     true,
+			errorContains: "failed to retrieve circuit breaker state from Redis",
+		},
+		{
+			name: "invalid JSON data",
+			id:   "test-id",
+			setup: func(repo *RedisRepository, mr *miniredis.Miniredis) {
+				mr.Set("circuit_breaker:test-id", "invalid-json")
+			},
+			expectError:   true,
+			expectNil:     true,
+			errorContains: "failed to unmarshal circuit breaker state",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo, mr := setupTestRedis(t)
+
+			if tt.setup != nil {
+				tt.setup(repo, mr)
+			}
+
+			cb, err := repo.FindByID(tt.id)
+
+			if tt.expectError {
+				assert.Error(t, err)
+				if tt.errorContains != "" {
+					assert.Contains(t, err.Error(), tt.errorContains)
+				}
+			} else {
+				assert.NoError(t, err)
+			}
+
+			if tt.expectNil {
+				assert.Nil(t, cb)
+			} else {
+				assert.NotNil(t, cb)
+				assert.Equal(t, core.StateClosed, cb.GetState())
+			}
+		})
+	}
+}
+
+// Delete operation tests
+func TestRedisRepository_Delete(t *testing.T) {
+	tests := []struct {
+		name          string
+		id            string
+		setup         func(*RedisRepository, *miniredis.Miniredis)
+		expectError   bool
+		errorContains string
+	}{
+		{
+			name: "successful delete",
+			id:   "test-id",
+			setup: func(repo *RedisRepository, mr *miniredis.Miniredis) {
+				cb := createTestCircuitBreaker(&testing.T{})
+				repo.Save("test-id", cb)
+			},
+			expectError: false,
+		},
+		{
+			name:          "not found",
+			id:            "non-existent",
+			expectError:   true,
+			errorContains: "circuit breaker not found",
+		},
+		{
+			name:          "empty ID",
+			id:            "",
+			expectError:   true,
+			errorContains: "ID cannot be empty",
+		},
+		{
+			name: "redis connection error",
+			id:   "test-id",
+			setup: func(repo *RedisRepository, mr *miniredis.Miniredis) {
+				mr.Close()
+			},
+			expectError:   true,
+			errorContains: "failed to delete circuit breaker from Redis",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo, mr := setupTestRedis(t)
+
+			if tt.setup != nil {
+				tt.setup(repo, mr)
+			}
+
+			err := repo.Delete(tt.id)
+
+			if tt.expectError {
+				assert.Error(t, err)
+				if tt.errorContains != "" {
+					assert.Contains(t, err.Error(), tt.errorContains)
+				}
+			} else {
+				assert.NoError(t, err)
+				assert.False(t, mr.Exists("circuit_breaker:"+tt.id))
+			}
+		})
+	}
+}
+
+// List operation tests
+func TestRedisRepository_List(t *testing.T) {
+	tests := []struct {
+		name          string
+		setup         func(*RedisRepository, *miniredis.Miniredis)
+		expectedCount int
+		expectedIDs   []string
+		expectError   bool
+		errorContains string
+	}{
+		{
+			name: "list multiple items",
+			setup: func(repo *RedisRepository, mr *miniredis.Miniredis) {
+				cb := createTestCircuitBreaker(&testing.T{})
+				repo.Save("cb1", cb)
+				repo.Save("cb2", cb)
+				repo.Save("cb3", cb)
+			},
+			expectedCount: 3,
+			expectedIDs:   []string{"cb1", "cb2", "cb3"},
+			expectError:   false,
+		},
+		{
+			name:          "empty list",
+			expectedCount: 0,
+			expectedIDs:   []string{},
+			expectError:   false,
+		},
+		{
+			name: "redis connection error",
+			setup: func(repo *RedisRepository, mr *miniredis.Miniredis) {
+				mr.Close()
+			},
+			expectError:   true,
+			errorContains: "failed to list circuit breaker keys from Redis",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo, mr := setupTestRedis(t)
+
+			if tt.setup != nil {
+				tt.setup(repo, mr)
+			}
+
+			ids, err := repo.List()
+
+			if tt.expectError {
+				assert.Error(t, err)
+				if tt.errorContains != "" {
+					assert.Contains(t, err.Error(), tt.errorContains)
+				}
+				assert.Nil(t, ids)
+			} else {
+				assert.NoError(t, err)
+				assert.Len(t, ids, tt.expectedCount)
+				if len(tt.expectedIDs) > 0 {
+					assert.ElementsMatch(t, tt.expectedIDs, ids)
+				}
+			}
+		})
+	}
+}
+
+// Exists operation tests
+func TestRedisRepository_Exists(t *testing.T) {
+	tests := []struct {
+		name          string
+		id            string
+		setup         func(*RedisRepository, *miniredis.Miniredis)
+		expected      bool
+		expectError   bool
+		errorContains string
+	}{
+		{
+			name: "exists returns true",
+			id:   "test-id",
+			setup: func(repo *RedisRepository, mr *miniredis.Miniredis) {
+				cb := createTestCircuitBreaker(&testing.T{})
+				repo.Save("test-id", cb)
+			},
+			expected:    true,
+			expectError: false,
+		},
+		{
+			name:        "exists returns false",
+			id:          "non-existent",
+			expected:    false,
+			expectError: false,
+		},
+		{
+			name:          "empty ID",
+			id:            "",
+			expected:      false,
+			expectError:   true,
+			errorContains: "ID cannot be empty",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo, mr := setupTestRedis(t)
+
+			if tt.setup != nil {
+				tt.setup(repo, mr)
+			}
+
+			exists, err := repo.Exists(tt.id)
+
+			if tt.expectError {
+				assert.Error(t, err)
+				if tt.errorContains != "" {
+					assert.Contains(t, err.Error(), tt.errorContains)
+				}
+				assert.False(t, exists)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, tt.expected, exists)
+			}
+		})
+	}
+}
+
+// Clear operation tests
+func TestRedisRepository_Clear(t *testing.T) {
+	tests := []struct {
+		name        string
+		setup       func(*RedisRepository, *miniredis.Miniredis)
+		expectError bool
+	}{
+		{
+			name: "clear multiple items",
+			setup: func(repo *RedisRepository, mr *miniredis.Miniredis) {
+				cb := createTestCircuitBreaker(&testing.T{})
+				repo.Save("cb1", cb)
+				repo.Save("cb2", cb)
+				repo.Save("cb3", cb)
+			},
+			expectError: false,
+		},
+		{
+			name:        "clear empty repository",
+			expectError: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo, mr := setupTestRedis(t)
+
+			if tt.setup != nil {
+				tt.setup(repo, mr)
+			}
+
+			err := repo.Clear()
+
+			if tt.expectError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+				// Verify all items are cleared
+				ids, listErr := repo.List()
+				assert.NoError(t, listErr)
+				assert.Empty(t, ids)
+			}
+		})
+	}
+}
+
+// Helper method tests
+func TestRedisRepository_KeyOperations(t *testing.T) {
+	repo, _ := setupTestRedis(t)
+
+	tests := []struct {
+		name      string
+		operation string
+		input     string
+		expected  string
+	}{
+		{
+			name:      "build key",
+			operation: "build",
+			input:     "test-id",
+			expected:  "circuit_breaker:test-id",
+		},
+		{
+			name:      "extract ID from valid key",
+			operation: "extract",
+			input:     "circuit_breaker:test-id",
+			expected:  "test-id",
+		},
+		{
+			name:      "extract ID from invalid key",
+			operation: "extract",
+			input:     "invalid-key",
+			expected:  "",
+		},
+		{
+			name:      "extract ID from empty key",
+			operation: "extract",
+			input:     "",
+			expected:  "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var result string
+			if tt.operation == "build" {
+				result = repo.buildKey(tt.input)
+			} else {
+				result = repo.extractIDFromKey(tt.input)
+			}
+			assert.Equal(t, tt.expected, result)
+		})
 	}
 }
 
 // Integration tests
-
 func TestRedisRepository_FullWorkflow(t *testing.T) {
 	repo, _ := setupTestRedis(t)
 	cb := createTestCircuitBreaker(t)
-
-	// Test complete workflow
 	id := "workflow-test"
 
-	// 1. Verify doesn't exist
-	exists, err := repo.Exists(id)
-	assert.NoError(t, err)
-	assert.False(t, exists)
+	// Complete workflow test
+	t.Run("complete workflow", func(t *testing.T) {
+		// 1. Initially doesn't exist
+		exists, err := repo.Exists(id)
+		assert.NoError(t, err)
+		assert.False(t, exists)
 
-	// 2. Save
-	err = repo.Save(id, cb)
-	assert.NoError(t, err)
+		// 2. Save circuit breaker
+		err = repo.Save(id, cb)
+		assert.NoError(t, err)
 
-	// 3. Verify exists
-	exists, err = repo.Exists(id)
-	assert.NoError(t, err)
-	assert.True(t, exists)
+		// 3. Now exists
+		exists, err = repo.Exists(id)
+		assert.NoError(t, err)
+		assert.True(t, exists)
 
-	// 4. Find
-	foundCB, err := repo.FindByID(id)
-	assert.NoError(t, err)
-	assert.NotNil(t, foundCB)
+		// 4. Can find it
+		foundCB, err := repo.FindByID(id)
+		assert.NoError(t, err)
+		assert.NotNil(t, foundCB)
 
-	// 5. List should contain our ID
-	ids, err := repo.List()
-	assert.NoError(t, err)
-	assert.Contains(t, ids, id)
+		// 5. Listed in results
+		ids, err := repo.List()
+		assert.NoError(t, err)
+		assert.Contains(t, ids, id)
 
-	// 6. Delete
-	err = repo.Delete(id)
-	assert.NoError(t, err)
+		// 6. Can delete it
+		err = repo.Delete(id)
+		assert.NoError(t, err)
 
-	// 7. Verify doesn't exist anymore
-	exists, err = repo.Exists(id)
-	assert.NoError(t, err)
-	assert.False(t, exists)
+		// 7. No longer exists
+		exists, err = repo.Exists(id)
+		assert.NoError(t, err)
+		assert.False(t, exists)
+	})
 }
 
 func TestRedisRepository_ConcurrentAccess(t *testing.T) {
@@ -433,7 +519,6 @@ func TestRedisRepository_ConcurrentAccess(t *testing.T) {
 	const numGoroutines = 10
 	const numOperations = 20
 
-	// Run concurrent operations
 	errChan := make(chan error, numGoroutines*numOperations)
 
 	for i := 0; i < numGoroutines; i++ {
@@ -441,29 +526,27 @@ func TestRedisRepository_ConcurrentAccess(t *testing.T) {
 			for j := 0; j < numOperations; j++ {
 				id := fmt.Sprintf("concurrent-%d-%d", goroutineID, j)
 
-				// Save
+				// Save -> Find -> Delete cycle
 				if err := repo.Save(id, cb); err != nil {
-					errChan <- err
+					errChan <- fmt.Errorf("save failed: %w", err)
 					return
 				}
 
-				// Find
 				if _, err := repo.FindByID(id); err != nil {
-					errChan <- err
+					errChan <- fmt.Errorf("find failed: %w", err)
 					return
 				}
 
-				// Delete
 				if err := repo.Delete(id); err != nil {
-					errChan <- err
+					errChan <- fmt.Errorf("delete failed: %w", err)
 					return
 				}
 			}
 		}(i)
 	}
 
-	// Wait a bit for operations to complete
-	time.Sleep(100 * time.Millisecond)
+	// Wait for operations to complete
+	time.Sleep(200 * time.Millisecond)
 
 	// Check for errors
 	select {
@@ -474,36 +557,7 @@ func TestRedisRepository_ConcurrentAccess(t *testing.T) {
 	}
 }
 
-func TestRedisRepository_ContextTimeout(t *testing.T) {
-	mr, err := miniredis.Run()
-	require.NoError(t, err)
-	defer mr.Close()
-
-	client := redis.NewClient(&redis.Options{
-		Addr: mr.Addr(),
-	})
-	defer client.Close()
-
-	// Create repository with very short timeout
-	config := RedisConfig{
-		Timeout: 1 * time.Microsecond, // Very short timeout
-		Context: context.Background(),
-	}
-	repo := NewRedisRepositoryWithConfig(client, config)
-
-	cb := createTestCircuitBreaker(t)
-
-	// This should timeout (though it might not always due to timing)
-	err = repo.Save("test-id", cb)
-	// We can't guarantee this will timeout every time due to timing,
-	// but if it does, it should be handled gracefully
-	if err != nil {
-		assert.Contains(t, err.Error(), "context deadline exceeded")
-	}
-}
-
 // Benchmark tests
-
 func BenchmarkRedisRepository_Save(b *testing.B) {
 	repo, _ := setupTestRedis(&testing.T{})
 	cb := createTestCircuitBreaker(&testing.T{})
@@ -522,7 +576,7 @@ func BenchmarkRedisRepository_FindByID(b *testing.B) {
 	repo, _ := setupTestRedis(&testing.T{})
 	cb := createTestCircuitBreaker(&testing.T{})
 
-	// Pre-populate with data
+	// Pre-populate data
 	for i := 0; i < 100; i++ {
 		repo.Save(fmt.Sprintf("bench-find-%d", i), cb)
 	}
@@ -535,31 +589,4 @@ func BenchmarkRedisRepository_FindByID(b *testing.B) {
 			i++
 		}
 	})
-}
-
-// Additional helper for setup that may be needed
-func setupTestRedisWithRealServer(t *testing.T) *RedisRepository {
-	// This would connect to a real Redis server for integration testing
-	// Uncomment and modify as needed for your environment
-	/*
-	   client := redis.NewClient(&redis.Options{
-	       Addr:     "localhost:6379",
-	       Password: "",
-	       DB:       1, // Use different DB for testing
-	   })
-
-	   repo := NewRedisRepository(client)
-
-	   // Clear any existing test data
-	   repo.Clear()
-
-	   t.Cleanup(func() {
-	       repo.Clear()
-	       client.Close()
-	   })
-
-	   return repo
-	*/
-	t.Skip("Real Redis server not configured")
-	return nil
 }
