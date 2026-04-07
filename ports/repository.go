@@ -1,10 +1,14 @@
 package ports
 
-import "go-circuit-breaker/core"
+import (
+	"context"
 
-type CircuitBreakerRepository interface {
-	FindByID(id string) (*core.CircuitBreaker, error)
-	Save(id string, cb *core.CircuitBreaker) error
-	Delete(id string) error
-	List() ([]string, error)
+	"go-circuit-breaker/core"
+)
+
+type SnapshotStore interface {
+	Load(ctx context.Context, id string) (*core.Snapshot, error)
+	Save(ctx context.Context, id string, snapshot core.Snapshot) error
+	Delete(ctx context.Context, id string) error
+	List(ctx context.Context) ([]string, error)
 }

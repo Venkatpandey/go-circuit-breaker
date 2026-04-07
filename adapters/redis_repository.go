@@ -5,283 +5,190 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"go-circuit-breaker/core"
 	"strings"
 	"time"
+
+	"go-circuit-breaker/core"
 
 	"github.com/go-redis/redis/v8"
 )
 
 const (
-	circuitBreakerKeyPrefix = "circuit_breaker:"
-	defaultTimeout          = 5 * time.Second
-	keyPattern              = circuitBreakerKeyPrefix + "*"
+	defaultRedisTimeout = 5 * time.Second
+	defaultScanCount    = int64(100)
+	defaultKeyPrefix    = "circuit_breaker:"
 )
 
-// RedisConfig holds configuration for Redis repository
-type RedisConfig struct {
-	Timeout time.Duration
-	Context context.Context
+type RedisStoreConfig struct {
+	Timeout   time.Duration
+	KeyPrefix string
+	ScanCount int64
 }
 
-// DefaultRedisConfig returns sensible defaults
-func DefaultRedisConfig() RedisConfig {
-	return RedisConfig{
-		Timeout: defaultTimeout,
-		Context: context.Background(),
+func DefaultRedisStoreConfig() RedisStoreConfig {
+	return RedisStoreConfig{
+		Timeout:   defaultRedisTimeout,
+		KeyPrefix: defaultKeyPrefix,
+		ScanCount: defaultScanCount,
 	}
 }
 
-type RedisRepository struct {
+type RedisStore struct {
 	client *redis.Client
-	config RedisConfig
+	config RedisStoreConfig
 }
 
-func NewRedisRepository(client *redis.Client) *RedisRepository {
-	return NewRedisRepositoryWithConfig(client, DefaultRedisConfig())
-}
-
-func NewRedisRepositoryWithConfig(client *redis.Client, config RedisConfig) *RedisRepository {
+func NewRedisStore(client *redis.Client, config RedisStoreConfig) (*RedisStore, error) {
 	if client == nil {
-		panic("redis client cannot be nil")
+		return nil, errors.New("redis client cannot be nil")
+	}
+	if config.Timeout <= 0 {
+		config.Timeout = defaultRedisTimeout
+	}
+	if config.KeyPrefix == "" {
+		config.KeyPrefix = defaultKeyPrefix
+	}
+	if config.ScanCount <= 0 {
+		config.ScanCount = defaultScanCount
 	}
 
-	return &RedisRepository{
+	return &RedisStore{
 		client: client,
 		config: config,
-	}
+	}, nil
 }
 
-// Save stores a circuit breaker with the given ID
-func (r *RedisRepository) Save(id string, cb *core.CircuitBreaker) error {
+func (r *RedisStore) Load(ctx context.Context, id string) (*core.Snapshot, error) {
 	if id == "" {
-		return errors.New("circuit breaker ID cannot be empty")
-	}
-	if cb == nil {
-		return errors.New("circuit breaker cannot be nil")
+		return nil, errors.New("circuit breaker id cannot be empty")
 	}
 
-	ctx, cancel := r.getContextWithTimeout()
+	ctx, cancel := r.withTimeout(ctx)
 	defer cancel()
 
-	// Create a serializable version of the circuit breaker
-	cbData := r.circuitBreakerToData(cb)
-
-	data, err := json.Marshal(cbData)
-	if err != nil {
-		return fmt.Errorf("failed to marshal circuit breaker state: %w", err)
-	}
-
-	key := r.buildKey(id)
-	err = r.client.Set(ctx, key, data, 0).Err()
-	if err != nil {
-		return fmt.Errorf("failed to save circuit breaker state to Redis (key: %s): %w", key, err)
-	}
-
-	return nil
-}
-
-// FindByID retrieves a circuit breaker by ID
-func (r *RedisRepository) FindByID(id string) (*core.CircuitBreaker, error) {
-	if id == "" {
-		return nil, errors.New("circuit breaker ID cannot be empty")
-	}
-
-	ctx, cancel := r.getContextWithTimeout()
-	defer cancel()
-
-	key := r.buildKey(id)
-	data, err := r.client.Get(ctx, key).Bytes()
+	raw, err := r.client.Get(ctx, r.key(id)).Bytes()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
-			return nil, nil // Not found
+			return nil, nil
 		}
-		return nil, fmt.Errorf("failed to retrieve circuit breaker state from Redis (key: %s): %w", key, err)
+		return nil, fmt.Errorf("load redis snapshot: %w", err)
 	}
 
-	var cbData circuitBreakerData
-	err = json.Unmarshal(data, &cbData)
-	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal circuit breaker state (key: %s): %w", key, err)
+	var snapshot core.Snapshot
+	if err := json.Unmarshal(raw, &snapshot); err != nil {
+		return nil, fmt.Errorf("decode redis snapshot: %w", err)
 	}
 
-	cb, err := r.dataToCircuitBreaker(cbData)
-	if err != nil {
-		return nil, fmt.Errorf("failed to reconstruct circuit breaker (key: %s): %w", key, err)
-	}
-
-	return cb, nil
+	return &snapshot, nil
 }
 
-// Delete removes a circuit breaker by ID
-func (r *RedisRepository) Delete(id string) error {
+func (r *RedisStore) Save(ctx context.Context, id string, snapshot core.Snapshot) error {
 	if id == "" {
-		return errors.New("circuit breaker ID cannot be empty")
+		return errors.New("circuit breaker id cannot be empty")
 	}
 
-	ctx, cancel := r.getContextWithTimeout()
+	ctx, cancel := r.withTimeout(ctx)
 	defer cancel()
 
-	key := r.buildKey(id)
-	result := r.client.Del(ctx, key)
-
-	if err := result.Err(); err != nil {
-		return fmt.Errorf("failed to delete circuit breaker from Redis (key: %s): %w", key, err)
+	payload, err := json.Marshal(snapshot)
+	if err != nil {
+		return fmt.Errorf("encode redis snapshot: %w", err)
 	}
 
-	// Check if the key actually existed
-	if result.Val() == 0 {
-		return fmt.Errorf("circuit breaker not found (key: %s)", key)
+	if err := r.client.Set(ctx, r.key(id), payload, 0).Err(); err != nil {
+		return fmt.Errorf("save redis snapshot: %w", err)
 	}
 
 	return nil
 }
 
-// List returns all circuit breaker IDs
-func (r *RedisRepository) List() ([]string, error) {
-	ctx, cancel := r.getContextWithTimeout()
-	defer cancel()
-
-	keys, err := r.client.Keys(ctx, keyPattern).Result()
-	if err != nil {
-		return nil, fmt.Errorf("failed to list circuit breaker keys from Redis: %w", err)
+func (r *RedisStore) Delete(ctx context.Context, id string) error {
+	if id == "" {
+		return errors.New("circuit breaker id cannot be empty")
 	}
 
-	ids := make([]string, 0, len(keys))
-	for _, key := range keys {
-		id := r.extractIDFromKey(key)
-		if id != "" {
-			ids = append(ids, id)
+	ctx, cancel := r.withTimeout(ctx)
+	defer cancel()
+
+	if err := r.client.Del(ctx, r.key(id)).Err(); err != nil {
+		return fmt.Errorf("delete redis snapshot: %w", err)
+	}
+
+	return nil
+}
+
+func (r *RedisStore) List(ctx context.Context) ([]string, error) {
+	ctx, cancel := r.withTimeout(ctx)
+	defer cancel()
+
+	var cursor uint64
+	ids := make([]string, 0)
+	pattern := r.config.KeyPrefix + "*"
+
+	for {
+		keys, nextCursor, err := r.client.Scan(ctx, cursor, pattern, r.config.ScanCount).Result()
+		if err != nil {
+			return nil, fmt.Errorf("scan redis keys: %w", err)
+		}
+		for _, key := range keys {
+			ids = append(ids, strings.TrimPrefix(key, r.config.KeyPrefix))
+		}
+		cursor = nextCursor
+		if cursor == 0 {
+			break
 		}
 	}
 
 	return ids, nil
 }
 
-// Exists checks if a circuit breaker exists
-func (r *RedisRepository) Exists(id string) (bool, error) {
-	if id == "" {
-		return false, errors.New("circuit breaker ID cannot be empty")
-	}
-
-	ctx, cancel := r.getContextWithTimeout()
+func (r *RedisStore) Ping(ctx context.Context) error {
+	ctx, cancel := r.withTimeout(ctx)
 	defer cancel()
-
-	key := r.buildKey(id)
-	result := r.client.Exists(ctx, key)
-
-	if err := result.Err(); err != nil {
-		return false, fmt.Errorf("failed to check circuit breaker existence (key: %s): %w", key, err)
-	}
-
-	return result.Val() > 0, nil
-}
-
-// Clear removes all circuit breakers (useful for testing)
-func (r *RedisRepository) Clear() error {
-	ctx, cancel := r.getContextWithTimeout()
-	defer cancel()
-
-	keys, err := r.client.Keys(ctx, keyPattern).Result()
-	if err != nil {
-		return fmt.Errorf("failed to get circuit breaker keys for clearing: %w", err)
-	}
-
-	if len(keys) == 0 {
-		return nil // Nothing to clear
-	}
-
-	err = r.client.Del(ctx, keys...).Err()
-	if err != nil {
-		return fmt.Errorf("failed to clear circuit breakers from Redis: %w", err)
-	}
-
-	return nil
-}
-
-// Ping checks Redis connectivity
-func (r *RedisRepository) Ping() error {
-	ctx, cancel := r.getContextWithTimeout()
-	defer cancel()
-
 	return r.client.Ping(ctx).Err()
 }
 
-// Helper methods
-
-func (r *RedisRepository) getContextWithTimeout() (context.Context, context.CancelFunc) {
-	if r.config.Context != nil {
-		return context.WithTimeout(r.config.Context, r.config.Timeout)
-	}
-	return context.WithTimeout(context.Background(), r.config.Timeout)
-}
-
-func (r *RedisRepository) buildKey(id string) string {
-	return circuitBreakerKeyPrefix + id
-}
-
-func (r *RedisRepository) extractIDFromKey(key string) string {
-	if !strings.HasPrefix(key, circuitBreakerKeyPrefix) {
-		return ""
-	}
-	return strings.TrimPrefix(key, circuitBreakerKeyPrefix)
-}
-
-// Serialization structs and methods
-
-// circuitBreakerData represents the serializable version of CircuitBreaker
-type circuitBreakerData struct {
-	State            int   `json:"state"`
-	FailureThreshold int   `json:"failure_threshold"`
-	SuccessThreshold int   `json:"success_threshold"`
-	FailureCount     int   `json:"failure_count"`
-	SuccessCount     int   `json:"success_count"`
-	Timeout          int64 `json:"timeout_ms"`         // Store as milliseconds
-	LastFailureTime  int64 `json:"last_failure_time"`  // Store as Unix timestamp
-	CooldownPeriod   int64 `json:"cooldown_period_ms"` // Store as milliseconds
-}
-
-func (r *RedisRepository) circuitBreakerToData(cb *core.CircuitBreaker) circuitBreakerData {
-	stats := cb.GetStats()
-	failureThreshold, successThreshold, timeout, cooldownPeriod := cb.GetConfiguration()
-
-	return circuitBreakerData{
-		State:            int(stats.State),
-		FailureThreshold: failureThreshold,
-		SuccessThreshold: successThreshold,
-		FailureCount:     stats.FailureCount,
-		SuccessCount:     stats.SuccessCount,
-		Timeout:          timeout.Milliseconds(),
-		LastFailureTime:  stats.LastFailure.Unix(),
-		CooldownPeriod:   cooldownPeriod.Milliseconds(),
-	}
-}
-
-func (r *RedisRepository) dataToCircuitBreaker(data circuitBreakerData) (*core.CircuitBreaker, error) {
-	timeout := time.Duration(data.Timeout) * time.Millisecond
-	cooldown := time.Duration(data.CooldownPeriod) * time.Millisecond
-
-	cb, err := core.NewCircuitBreaker(
-		data.FailureThreshold,
-		data.SuccessThreshold,
-		timeout,
-		cooldown,
-	)
+func (r *RedisStore) Clear(ctx context.Context) error {
+	ids, err := r.List(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create circuit breaker from data: %w", err)
+		return err
+	}
+	if len(ids) == 0 {
+		return nil
 	}
 
-	// Restore the saved state
-	lastFailure := time.Unix(data.LastFailureTime, 0)
-	err = cb.RestoreState(
-		core.State(data.State),
-		data.FailureCount,
-		data.SuccessCount,
-		lastFailure,
-	)
+	ctx, cancel := r.withTimeout(ctx)
+	defer cancel()
+
+	keys := make([]string, 0, len(ids))
+	for _, id := range ids {
+		keys = append(keys, r.key(id))
+	}
+	return r.client.Del(ctx, keys...).Err()
+}
+
+func (r *RedisStore) Exists(ctx context.Context, id string) (bool, error) {
+	if id == "" {
+		return false, errors.New("circuit breaker id cannot be empty")
+	}
+
+	ctx, cancel := r.withTimeout(ctx)
+	defer cancel()
+
+	count, err := r.client.Exists(ctx, r.key(id)).Result()
 	if err != nil {
-		return nil, fmt.Errorf("failed to restore circuit breaker state: %w", err)
+		return false, fmt.Errorf("check redis snapshot existence: %w", err)
 	}
+	return count > 0, nil
+}
 
-	return cb, nil
+func (r *RedisStore) key(id string) string {
+	return r.config.KeyPrefix + id
+}
+
+func (r *RedisStore) withTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithTimeout(ctx, r.config.Timeout)
 }

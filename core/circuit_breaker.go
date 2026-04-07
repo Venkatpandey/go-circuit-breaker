@@ -9,9 +9,7 @@ import (
 
 var (
 	ErrCircuitOpen   = errors.New("circuit breaker is open")
-	ErrMaxAttempts   = errors.New("max attempts reached")
 	ErrInvalidState  = errors.New("invalid state")
-	ErrTimeout       = errors.New("operation timeout")
 	ErrInvalidConfig = errors.New("invalid configuration")
 )
 
@@ -36,200 +34,285 @@ func (s State) String() string {
 	}
 }
 
-type CircuitBreaker struct {
-	mu               sync.RWMutex
-	state            State         `json:"state"`
-	failureThreshold int           `json:"failure_threshold"`
-	successThreshold int           `json:"success_threshold"`
-	failureCount     int           `json:"failure_count"`
-	successCount     int           `json:"success_count"`
-	timeout          time.Duration `json:"timeout"`
-	lastFailureTime  time.Time     `json:"last_failure_time"`
-	cooldownPeriod   time.Duration `json:"cooldown_period"`
+type Config struct {
+	FailureThreshold int           `json:"failure_threshold"`
+	SuccessThreshold int           `json:"success_threshold"`
+	CooldownPeriod   time.Duration `json:"cooldown_period"`
+	RequestTimeout   time.Duration `json:"request_timeout"`
+}
+
+func DefaultConfig() Config {
+	return Config{
+		FailureThreshold: 5,
+		SuccessThreshold: 2,
+		CooldownPeriod:   30 * time.Second,
+		RequestTimeout:   0,
+	}
+}
+
+func (c Config) Validate() error {
+	switch {
+	case c.FailureThreshold <= 0:
+		return errors.New("failure threshold must be positive")
+	case c.SuccessThreshold <= 0:
+		return errors.New("success threshold must be positive")
+	case c.CooldownPeriod <= 0:
+		return errors.New("cooldown period must be positive")
+	case c.RequestTimeout < 0:
+		return errors.New("request timeout cannot be negative")
+	default:
+		return nil
+	}
 }
 
 type Stats struct {
-	State        State     `json:"state"`
-	FailureCount int       `json:"failure_count"`
-	SuccessCount int       `json:"success_count"`
-	LastFailure  time.Time `json:"last_failure_time"`
+	State                 State     `json:"state"`
+	ConsecutiveFailures   int       `json:"consecutive_failures"`
+	ConsecutiveSuccesses  int       `json:"consecutive_successes"`
+	LastFailureTime       time.Time `json:"last_failure_time"`
+	LastStateChangeTime   time.Time `json:"last_state_change_time"`
+	HalfOpenProbeInFlight bool      `json:"half_open_probe_in_flight"`
 }
 
-func NewCircuitBreaker(failureThreshold, successThreshold int, timeout, cooldownPeriod time.Duration) (*CircuitBreaker, error) {
-	if failureThreshold <= 0 {
-		return nil, errors.New("failure threshold must be positive")
-	}
-	if successThreshold <= 0 {
-		return nil, errors.New("success threshold must be positive")
-	}
-	if timeout <= 0 {
-		return nil, errors.New("timeout must be positive")
-	}
-	if cooldownPeriod <= 0 {
-		return nil, errors.New("cooldown period must be positive")
+type Snapshot struct {
+	Config Config `json:"config"`
+	Stats  Stats  `json:"stats"`
+}
+
+type Completion func(err error)
+
+type CircuitBreaker struct {
+	mu                    sync.RWMutex
+	config                Config
+	state                 State
+	consecutiveFailures   int
+	consecutiveSuccesses  int
+	lastFailureTime       time.Time
+	lastStateChangeTime   time.Time
+	halfOpenProbeInFlight bool
+}
+
+func NewCircuitBreaker(config Config) (*CircuitBreaker, error) {
+	if err := config.Validate(); err != nil {
+		return nil, err
 	}
 
+	now := time.Now()
 	return &CircuitBreaker{
-		state:            StateClosed,
-		failureThreshold: failureThreshold,
-		successThreshold: successThreshold,
-		timeout:          timeout,
-		cooldownPeriod:   cooldownPeriod,
+		config:              config,
+		state:               StateClosed,
+		lastStateChangeTime: now,
 	}, nil
 }
 
-func (cb *CircuitBreaker) Execute(fn func() error) error {
-	return cb.ExecuteWithContext(context.Background(), fn)
-}
-
-func (cb *CircuitBreaker) ExecuteWithContext(ctx context.Context, fn func() error) error {
-	// Check if we can execute
-	if !cb.allowRequest() {
-		return ErrCircuitOpen
+func NewCircuitBreakerFromSnapshot(snapshot Snapshot) (*CircuitBreaker, error) {
+	if err := snapshot.Config.Validate(); err != nil {
+		return nil, err
+	}
+	if snapshot.Stats.State < StateClosed || snapshot.Stats.State > StateHalfOpen {
+		return nil, ErrInvalidState
 	}
 
-	// Create timeout context
-	timeoutCtx, cancel := context.WithTimeout(ctx, cb.timeout)
+	cb := &CircuitBreaker{
+		config:                snapshot.Config,
+		state:                 snapshot.Stats.State,
+		consecutiveFailures:   snapshot.Stats.ConsecutiveFailures,
+		consecutiveSuccesses:  snapshot.Stats.ConsecutiveSuccesses,
+		lastFailureTime:       snapshot.Stats.LastFailureTime,
+		lastStateChangeTime:   snapshot.Stats.LastStateChangeTime,
+		halfOpenProbeInFlight: snapshot.Stats.HalfOpenProbeInFlight,
+	}
+
+	if cb.lastStateChangeTime.IsZero() {
+		cb.lastStateChangeTime = time.Now()
+	}
+
+	return cb, nil
+}
+
+func (cb *CircuitBreaker) Execute(ctx context.Context, fn func(context.Context) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	done, err := cb.Allow()
+	if err != nil {
+		return err
+	}
+
+	execCtx := ctx
+	cancel := func() {}
+	if cb.config.RequestTimeout > 0 {
+		execCtx, cancel = context.WithTimeout(ctx, cb.config.RequestTimeout)
+	}
 	defer cancel()
 
-	// Execute with timeout
-	resultChan := make(chan error, 1)
-	go func() {
-		resultChan <- fn()
-	}()
-
-	select {
-	case err := <-resultChan:
-		cb.recordResult(err)
-		return err
-	case <-timeoutCtx.Done():
-		cb.recordResult(ErrTimeout)
-		return ErrTimeout
-	}
+	err = fn(execCtx)
+	done(err)
+	return err
 }
 
-func (cb *CircuitBreaker) allowRequest() bool {
+func (cb *CircuitBreaker) Allow() (Completion, error) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
+	now := time.Now()
+
 	switch cb.state {
 	case StateClosed:
-		return true
+		return cb.newCompletion(false), nil
 	case StateOpen:
-		if time.Since(cb.lastFailureTime) >= cb.cooldownPeriod {
-			cb.state = StateHalfOpen
-			cb.resetCounts()
-			return true
+		if now.Sub(cb.lastFailureTime) < cb.config.CooldownPeriod {
+			return nil, ErrCircuitOpen
 		}
-		return false
+		cb.transitionToLocked(StateHalfOpen, now)
+		cb.consecutiveFailures = 0
+		cb.consecutiveSuccesses = 0
+		cb.halfOpenProbeInFlight = false
 	case StateHalfOpen:
-		return true
 	default:
-		return false
+		return nil, ErrInvalidState
 	}
-}
 
-func (cb *CircuitBreaker) recordResult(err error) {
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
-
-	if err != nil {
-		cb.onFailure()
-	} else {
-		cb.onSuccess()
+	if cb.halfOpenProbeInFlight {
+		return nil, ErrCircuitOpen
 	}
+
+	cb.halfOpenProbeInFlight = true
+	return cb.newCompletion(true), nil
 }
 
-func (cb *CircuitBreaker) onFailure() {
-	cb.failureCount++
-
-	switch cb.state {
-	case StateClosed:
-		if cb.failureCount >= cb.failureThreshold {
-			cb.state = StateOpen
-			cb.lastFailureTime = time.Now()
-		}
-	case StateHalfOpen:
-		cb.state = StateOpen
-		cb.lastFailureTime = time.Now()
-		cb.resetCounts()
-	}
-}
-
-func (cb *CircuitBreaker) onSuccess() {
-	cb.successCount++
-
-	switch cb.state {
-	case StateClosed:
-		// Reset failure count on success in closed state
-		cb.failureCount = 0
-	case StateHalfOpen:
-		if cb.successCount >= cb.successThreshold {
-			cb.state = StateClosed
-			cb.resetCounts()
-		}
-	}
-}
-
-func (cb *CircuitBreaker) resetCounts() {
-	cb.failureCount = 0
-	cb.successCount = 0
-}
-
-// GetStats returns current circuit breaker statistics
-func (cb *CircuitBreaker) GetStats() Stats {
-	cb.mu.RLock()
-	defer cb.mu.RUnlock()
-
-	return Stats{
-		State:        cb.state,
-		FailureCount: cb.failureCount,
-		SuccessCount: cb.successCount,
-		LastFailure:  cb.lastFailureTime,
-	}
-}
-
-// GetState returns current state (thread-safe)
-func (cb *CircuitBreaker) GetState() State {
+func (cb *CircuitBreaker) State() State {
 	cb.mu.RLock()
 	defer cb.mu.RUnlock()
 	return cb.state
 }
 
-// ForceOpen manually opens the circuit breaker
+func (cb *CircuitBreaker) Stats() Stats {
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
+
+	return Stats{
+		State:                 cb.state,
+		ConsecutiveFailures:   cb.consecutiveFailures,
+		ConsecutiveSuccesses:  cb.consecutiveSuccesses,
+		LastFailureTime:       cb.lastFailureTime,
+		LastStateChangeTime:   cb.lastStateChangeTime,
+		HalfOpenProbeInFlight: cb.halfOpenProbeInFlight,
+	}
+}
+
+func (cb *CircuitBreaker) Snapshot() Snapshot {
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
+
+	return Snapshot{
+		Config: cb.config,
+		Stats: Stats{
+			State:                 cb.state,
+			ConsecutiveFailures:   cb.consecutiveFailures,
+			ConsecutiveSuccesses:  cb.consecutiveSuccesses,
+			LastFailureTime:       cb.lastFailureTime,
+			LastStateChangeTime:   cb.lastStateChangeTime,
+			HalfOpenProbeInFlight: cb.halfOpenProbeInFlight,
+		},
+	}
+}
+
+func (cb *CircuitBreaker) Config() Config {
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
+	return cb.config
+}
+
 func (cb *CircuitBreaker) ForceOpen() {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
-	cb.state = StateOpen
-	cb.lastFailureTime = time.Now()
+
+	now := time.Now()
+	cb.transitionToLocked(StateOpen, now)
+	cb.consecutiveFailures = cb.config.FailureThreshold
+	cb.consecutiveSuccesses = 0
+	cb.lastFailureTime = now
+	cb.halfOpenProbeInFlight = false
 }
 
-// ForceClose manually closes the circuit breaker
 func (cb *CircuitBreaker) ForceClose() {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
-	cb.state = StateClosed
-	cb.resetCounts()
+
+	cb.transitionToLocked(StateClosed, time.Now())
+	cb.consecutiveFailures = 0
+	cb.consecutiveSuccesses = 0
+	cb.halfOpenProbeInFlight = false
 }
 
-func (cb *CircuitBreaker) RestoreState(state State, failureCount, successCount int, lastFailureTime time.Time) error {
+func (cb *CircuitBreaker) newCompletion(halfOpenProbe bool) Completion {
+	var once sync.Once
+	return func(err error) {
+		once.Do(func() {
+			cb.afterExecution(halfOpenProbe, err)
+		})
+	}
+}
+
+func (cb *CircuitBreaker) afterExecution(halfOpenProbe bool, err error) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
-	if state < StateClosed || state > StateHalfOpen {
-		return ErrInvalidState
+	now := time.Now()
+	if halfOpenProbe {
+		cb.halfOpenProbeInFlight = false
 	}
 
-	cb.state = state
-	cb.failureCount = failureCount
-	cb.successCount = successCount
-	cb.lastFailureTime = lastFailureTime
+	if err == nil {
+		cb.onSuccessLocked(now)
+		return
+	}
 
-	return nil
+	cb.onFailureLocked(now)
 }
 
-func (cb *CircuitBreaker) GetConfiguration() (int, int, time.Duration, time.Duration) {
-	cb.mu.RLock()
-	defer cb.mu.RUnlock()
-	return cb.failureThreshold, cb.successThreshold, cb.timeout, cb.cooldownPeriod
+func (cb *CircuitBreaker) onSuccessLocked(now time.Time) {
+	switch cb.state {
+	case StateClosed:
+		cb.consecutiveFailures = 0
+		cb.consecutiveSuccesses++
+	case StateHalfOpen:
+		cb.consecutiveFailures = 0
+		cb.consecutiveSuccesses++
+		if cb.consecutiveSuccesses >= cb.config.SuccessThreshold {
+			cb.transitionToLocked(StateClosed, now)
+			cb.consecutiveFailures = 0
+			cb.consecutiveSuccesses = 0
+		}
+	}
+}
+
+func (cb *CircuitBreaker) onFailureLocked(now time.Time) {
+	cb.lastFailureTime = now
+
+	switch cb.state {
+	case StateClosed:
+		cb.consecutiveFailures++
+		cb.consecutiveSuccesses = 0
+		if cb.consecutiveFailures >= cb.config.FailureThreshold {
+			cb.transitionToLocked(StateOpen, now)
+		}
+	case StateHalfOpen:
+		cb.consecutiveFailures = 1
+		cb.consecutiveSuccesses = 0
+		cb.transitionToLocked(StateOpen, now)
+	}
+}
+
+func (cb *CircuitBreaker) transitionToLocked(next State, now time.Time) {
+	if cb.state == next {
+		return
+	}
+	cb.state = next
+	cb.lastStateChangeTime = now
 }

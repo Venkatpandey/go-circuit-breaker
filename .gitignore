@@ -1,2 +1,6 @@
 .idea/
-/.idea/
+.DS_Store
+bin/
+.gocache/
+.gotmp/
+coverage.out
