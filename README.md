@@ -1,204 +1,256 @@
-# Go Circuit Breaker
+# go-circuit-breaker
 
-A Go library demonstrating resilient service communication patterns including circuit breakers, retry mechanisms, and failure simulation with Redis integration.
+[![CI](https://github.com/Venkatpandey/go-circuit-breaker/actions/workflows/ci.yml/badge.svg)](https://github.com/Venkatpandey/go-circuit-breaker/actions/workflows/ci.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/Venkatpandey/go-circuit-breaker)](https://goreportcard.com/report/github.com/Venkatpandey/go-circuit-breaker)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/Venkatpandey/go-circuit-breaker)](https://github.com/Venkatpandey/go-circuit-breaker/blob/main/go.mod)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/Venkatpandey/go-circuit-breaker/blob/main/LICENSE)
 
-## Features
+`go-circuit-breaker` is a library-first Go implementation of the circuit breaker pattern for production services. It is designed for **local, in-process admission control** with an optional Redis adapter for snapshot persistence and operational introspection.
 
-- **Circuit Breaker Pattern**: Prevents cascading failures with configurable thresholds
-- **Retry Logic with Backoff**: Exponential backoff with jitter for optimal retry patterns
-- **Service Simulations**: Multiple failure scenarios to test retry behavior
-    - Unreliable services with configurable failure rates
-    - Slow services with variable response times
-    - Recovering services that succeed after N attempts
-- **Redis Integration**: Demonstrates retry patterns with external dependencies
-- **Docker Support**: Containerized Redis for easy local development
-- **Comprehensive Testing**: Unit tests and integration tests with coverage reports
-- **Benchmarking**: Performance testing for retry mechanisms
+The project ships one runnable demo under `cmd/http-demo` and keeps Redis out of the hot path by default.
 
-## Getting Started
+## Why local-first
+
+The primary production model is one breaker per process protecting the dependency that process calls.
+
+- Fast fail-open decisions stay in memory.
+- Breaker behavior does not depend on Redis availability.
+- Multi-instance race conditions are avoided because breaker state is not used as shared distributed coordination.
+
+Redis is supported as an **optional adapter** for snapshots, state export, and demo/integration workflows. It is not positioned as a distributed breaker coordinator in v1.
+
+## Packages
+
+- `core`: breaker state machine, config, execution API, stats, snapshots
+- `service`: named breaker manager and optional persistence policy
+- `adapters`: optional integrations such as Redis snapshot storage
+- `cmd/http-demo`: runnable HTTP demo
+
+## Get started
 
 ### Prerequisites
 
-- Go 1.21 or higher
-- Docker and Docker Compose
-- Make (optional, but recommended)
+- Go 1.24 or newer
+- Make
+- Docker only if you want to run Redis locally for adapter experiments
 
-### Quick Start
-
-1. **Clone and setup**:
-   ```bash
-   git clone <your-repo>
-   cd go-circuit-breaker
-   make dev  # Downloads dependencies and formats code
-   ```
-
-2. **Start Redis and run the application**:
-   ```bash
-   make run-with-redis
-   ```
-
-3. **Run all tests**:
-   ```bash
-   make test-integration
-   ```
-
-### Manual Setup (without Make)
+### 1. Clone the repository
 
 ```bash
-# Start Redis container
-docker run -d --name redis-test -p 6379:6379 redis:7-alpine
-
-# Build and run
-go build -o bin/go-circuit-breaker .
-REDIS_URL=localhost:6379 ./bin/go-circuit-breaker
+git clone git@github.com:Venkatpandey/go-circuit-breaker.git
+cd go-circuit-breaker
 ```
 
-## Running Simulations
+### 2. Run the default verification suite
 
-### All Simulation Scenarios
 ```bash
-make simulate-all
+make test
+make test-race
 ```
 
-### Individual Scenarios
+### 3. Run the HTTP demo
 
-**Unreliable Service** (30% failure rate):
 ```bash
-make docker-up
-REDIS_URL=localhost:6379 SCENARIO=unreliable go run .
+make demo
 ```
 
-**Slow Service** (200ms-2s response times):
-```bash
-REDIS_URL=localhost:6379 SCENARIO=slow go run .
-```
+The demo shows:
 
-**Recovering Service** (fails first 3 attempts):
-```bash
-REDIS_URL=localhost:6379 SCENARIO=recovering go run .
-```
+- repeated upstream failures
+- breaker opening
+- requests blocked while open
+- half-open recovery probes
+- breaker closing again after recovery
 
-## Available Commands
+### 4. Use the library in your project
 
-### Development
-- `make dev` - Setup development environment
-- `make build` - Build the application
-- `make run` - Build and run the application
-- `make test` - Run all tests
-- `make test-cover` - Run tests with coverage report
-
-### Docker Management
-- `make docker-up` - Start Redis container
-- `make docker-down` - Stop Redis container
-- `make docker-logs` - View Redis logs
-- `make docker-shell` - Connect to Redis CLI
-
-### Testing & Simulation
-- `make test-integration` - Run integration tests with Redis
-- `make simulate-all` - Run all simulation scenarios
-- `make benchmark` - Run performance benchmarks
-
-### Utilities
-- `make clean` - Clean build artifacts
-- `make clean-all` - Clean everything including Docker containers
-- `make help` - Show all available commands
-
-## Project Structure
-
-```
-├── main.go              # Main application with circuit breaker and retry logic
-├── *_test.go           # Test files
-├── Makefile            # Build and development automation
-├── go.mod              # Go module dependencies
-└── bin/                # Built binaries (created after build)
-```
-
-## Integration Examples
-
-### HTTP Service Integration
+Start with a local, in-memory manager and one breaker ID per dependency:
 
 ```go
 package main
 
 import (
-    "context"
-    "fmt"
-    "time"
+	"context"
+	"errors"
+	"time"
+
+	"go-circuit-breaker/core"
+	"go-circuit-breaker/service"
 )
 
 func main() {
-    // Create HTTP client with circuit breaker and retry
-    client := NewHTTPClient(5 * time.Second)
-    
-    // Use in your application
-    ctx := context.Background()
-    resp, err := client.Get(ctx, "https://api.example.com/users/1")
-    if err != nil {
-        fmt.Printf("Request failed: %v\n", err)
-        return
-    }
-    defer resp.Body.Close()
-    
-    fmt.Printf("Response: %s\n", resp.Status)
+	manager, err := service.NewManager(service.Options{
+		BreakerConfig: core.Config{
+			FailureThreshold: 5,
+			SuccessThreshold: 2,
+			CooldownPeriod:   30 * time.Second,
+			RequestTimeout:   2 * time.Second,
+		},
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	_ = manager.Execute(context.Background(), "payments-api", func(ctx context.Context) error {
+		// Your dependency call should honor ctx cancellation.
+		return errors.New("upstream failed")
+	})
 }
 ```
 
-The HTTP client automatically handles:
-- **Circuit breaker**: Prevents cascade failures after 5 consecutive failures
-- **Retry logic**: 3 attempts with exponential backoff (100ms to 5s)
-- **Timeout handling**: Configurable per-request timeouts
-- **Context support**: Proper cancellation and deadline handling
+### 5. Optional Redis-backed snapshots
 
-See `examples/http_integration.go` for a complete implementation.
-
-### Database Integration
-
-```go
-// Example with database operations
-func queryWithResilience(db *sql.DB, query string) error {
-    operation := func() error {
-        _, err := db.Exec(query)
-        return err
-    }
-    
-    return retryWithCircuitBreaker(operation, retryConfig{
-        maxAttempts: 3,
-        baseDelay:   200 * time.Millisecond,
-    })
-}
-```
-
-## Configuration
-
-Environment variables:
-- `REDIS_URL` - Redis connection string (default: localhost:6379)
-- `SCENARIO` - Simulation scenario: unreliable, slow, recovering
-
-## Testing
-
-Run different types of tests:
+If you want persistence or state inspection support:
 
 ```bash
-# Unit tests only
-go test ./...
-
-# Integration tests with Redis
+make docker-up
 make test-integration
+```
 
-# Tests with coverage
-make test-cover
+## Public API shape
 
-# Benchmarks
+The public API is **context-first**.
+
+- `(*core.CircuitBreaker).Execute(ctx, func(ctx context.Context) error)` is the convenience wrapper.
+- `(*core.CircuitBreaker).Allow()` exposes lower-level admission control for advanced integrations.
+- `(*service.Manager).Execute(ctx, id, fn)` manages named breakers without requiring any external store.
+
+The library does not spawn goroutines around your operation. If you configure `RequestTimeout`, the library derives a child context and passes it to your function. Your dependency code must honor that context for cancellation to take effect.
+
+## Why use this over `sony/gobreaker`?
+
+`sony/gobreaker` is one of the most widely used circuit breaker libraries in Go and is a good default choice when you want a very established package with broader policy knobs.
+
+This project is a better fit when you specifically want:
+
+- a **local-first production model** with no ambiguity around distributed breaker coordination
+- a **context-first API** that makes cancellation part of the normal execution flow
+- a **small, explicit surface area** that is easy to audit and integrate
+- **optional persistence** for snapshots and inspection without putting Redis on the hot path
+- a straightforward manager layer for **named in-process breakers**
+
+`sony/gobreaker` is currently stronger if you need:
+
+- more mature ecosystem adoption and battle-tested history
+- richer trip-policy tuning out of the box
+- broader hook/configuration support
+- a more established default choice for teams that prefer convention over opinionated architecture
+
+In short:
+
+- Choose `go-circuit-breaker` if you want a simple, fast, context-aware, local-first breaker with clear persistence boundaries.
+- Choose `sony/gobreaker` if you want the most established Go circuit breaker package with a longer production track record and more built-in policy flexibility.
+
+This project does **not** try to claim feature parity with `sony/gobreaker` yet. Its value proposition is clarity, local-first architecture, and a clean hot path for modern Go services.
+
+## Half-open behavior
+
+The default half-open semantics are intentionally strict:
+
+- After cooldown, the breaker transitions from `OPEN` to `HALF_OPEN`.
+- Exactly one probe request is allowed at a time.
+- Additional requests fail fast with `core.ErrCircuitOpen` while that probe is in flight.
+- Successful probes close the breaker after `SuccessThreshold` consecutive successes.
+- Any failed probe reopens the breaker immediately.
+
+## Redis adapter
+
+The Redis adapter stores serialized `core.Snapshot` values and is best used for:
+
+- state inspection
+- low-frequency persistence
+- integration tests or demos
+
+It is not intended to provide shared distributed breaker coordination.
+
+Example:
+
+```go
+client := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+store, err := adapters.NewRedisStore(client, adapters.DefaultRedisStoreConfig())
+if err != nil {
+	panic(err)
+}
+
+manager, err := service.NewManager(service.Options{
+	BreakerConfig: core.DefaultConfig(),
+	Store:         store,
+	PersistPolicy: service.PersistOnStateChange,
+})
+```
+
+Persistence policies:
+
+- `service.PersistOnStateChange`: default and recommended
+- `service.PersistAlways`: persist after every execution
+- `service.PersistNever`: disable persistence entirely
+
+## Build and development
+
+```bash
+make build
+make test
+make test-race
+make benchmark
+make demo
+```
+
+Optional Redis workflows:
+
+```bash
+make test-integration
+```
+
+If you want a real Redis instance for manual experimentation, you can also run:
+
+```bash
+make docker-up
+```
+
+## Operational guidance
+
+- Keep breaker IDs bounded and meaningful. The manager cache is process-local and grows with distinct IDs until you delete them or restart the process.
+- Prefer one breaker per dependency or dependency slice, not per request or per user.
+- Use `PersistOnStateChange` unless you have a specific need for higher-frequency snapshots.
+- Use request timeouts deliberately. The library can derive a timeout context, but your dependency call must honor it.
+- For large Redis keyspaces, listing uses `SCAN`, not `KEYS`, to avoid blocking the server.
+
+## Benchmarks
+
+Run the local benchmark suite with:
+
+```bash
 make benchmark
 ```
 
-## Contributing
+Latest local benchmark sample:
 
-1. Run `make dev` to set up the development environment
-2. Make your changes
-3. Run `make ci` to ensure all checks pass
-4. Submit a pull request
+- Environment: `darwin/arm64`, Apple M1
+- Command: `go test -run=^$ -bench=. -benchmem ./core ./service`
 
-## License
+```text
+pkg: go-circuit-breaker/core
+BenchmarkCircuitBreakerExecuteSuccess-8          4328516   309.8 ns/op   48 B/op   2 allocs/op
+BenchmarkCircuitBreakerAllowCompleteSuccess-8    3465748   289.0 ns/op   48 B/op   2 allocs/op
+BenchmarkCircuitBreakerOpenFastFail-8           10541118   113.8 ns/op    0 B/op   0 allocs/op
+BenchmarkCircuitBreakerExecuteParallel-8         2109230   568.9 ns/op   48 B/op   2 allocs/op
 
-MIT License
+pkg: go-circuit-breaker/service
+BenchmarkManagerExecuteHotPath-8                 3512440   365.5 ns/op   48 B/op   2 allocs/op
+BenchmarkManagerExecutePersistAlways-8           2597545   387.5 ns/op   48 B/op   2 allocs/op
+```
+
+These numbers are intended as a reference point for the in-memory hot path. Actual results will vary by CPU, Go version, OS, and whether your production code adds network calls, tracing, logging, or persistence on top.
+
+## Testing
+
+- `make test`: unit tests for the library and manager layers
+- `make test-race`: race detector across the default test suite
+- `make test-integration`: Redis adapter tests behind the `integration` build tag
+- `make benchmark`: local microbenchmarks for the core and manager hot paths
+
+## Open source basics
+
+- License: MIT, see `LICENSE`
+- Contribution notes: see `CONTRIBUTING.md`
+- CI: see `.github/workflows/ci.yml`

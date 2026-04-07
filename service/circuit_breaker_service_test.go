@@ -3,718 +3,332 @@ package service
 import (
 	"context"
 	"errors"
-	"fmt"
-	"go-circuit-breaker/core"
 	"sync"
 	"testing"
 	"time"
+
+	"go-circuit-breaker/core"
 )
 
-// Mock repository for testing
-type mockRepository struct {
-	mu          sync.RWMutex
-	data        map[string]*core.CircuitBreaker
-	findError   error
-	saveError   error
-	deleteError error
-	listError   error
-	findCalls   int
+type mockStore struct {
+	mu          sync.Mutex
+	data        map[string]core.Snapshot
+	loadCalls   int
 	saveCalls   int
 	deleteCalls int
 	listCalls   int
+	loadErr     error
+	saveErr     error
+	deleteErr   error
+	listErr     error
 }
 
-func newMockRepository() *mockRepository {
-	return &mockRepository{
-		data: make(map[string]*core.CircuitBreaker),
-	}
+func newMockStore() *mockStore {
+	return &mockStore{data: make(map[string]core.Snapshot)}
 }
 
-func (m *mockRepository) FindByID(id string) (*core.CircuitBreaker, error) {
+func (m *mockStore) Load(_ context.Context, id string) (*core.Snapshot, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.findCalls++
-
-	if m.findError != nil {
-		return nil, m.findError
+	m.loadCalls++
+	if m.loadErr != nil {
+		return nil, m.loadErr
 	}
-
-	cb, exists := m.data[id]
-	if !exists {
+	snapshot, ok := m.data[id]
+	if !ok {
 		return nil, nil
 	}
-	return cb, nil
+	copy := snapshot
+	return &copy, nil
 }
 
-func (m *mockRepository) Save(id string, cb *core.CircuitBreaker) error {
+func (m *mockStore) Save(_ context.Context, id string, snapshot core.Snapshot) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.saveCalls++
-
-	if m.saveError != nil {
-		return m.saveError
+	if m.saveErr != nil {
+		return m.saveErr
 	}
-
-	m.data[id] = cb
+	m.data[id] = snapshot
 	return nil
 }
 
-func (m *mockRepository) Delete(id string) error {
+func (m *mockStore) Delete(_ context.Context, id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.deleteCalls++
-
-	if m.deleteError != nil {
-		return m.deleteError
+	if m.deleteErr != nil {
+		return m.deleteErr
 	}
-
 	delete(m.data, id)
 	return nil
 }
 
-func (m *mockRepository) List() ([]string, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+func (m *mockStore) List(_ context.Context) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.listCalls++
-
-	if m.listError != nil {
-		return nil, m.listError
+	if m.listErr != nil {
+		return nil, m.listErr
 	}
-
-	var ids []string
+	ids := make([]string, 0, len(m.data))
 	for id := range m.data {
 		ids = append(ids, id)
 	}
 	return ids, nil
 }
 
-func (m *mockRepository) reset() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.data = make(map[string]*core.CircuitBreaker)
-	m.findError = nil
-	m.saveError = nil
-	m.deleteError = nil
-	m.listError = nil
-	m.findCalls = 0
-	m.saveCalls = 0
-	m.deleteCalls = 0
-	m.listCalls = 0
-}
-
-func TestNewCircuitBreakerService(t *testing.T) {
-	tests := []struct {
-		name           string
-		customConfig   *Config
-		expectedConfig Config
-	}{
-		{
-			name:           "default config",
-			customConfig:   nil,
-			expectedConfig: DefaultConfig(),
-		},
-		{
-			name: "custom config",
-			customConfig: &Config{
-				FailureThreshold: 10,
-				SuccessThreshold: 5,
-				Timeout:          2 * time.Second,
-				CooldownPeriod:   10 * time.Second,
-			},
-			expectedConfig: Config{
-				FailureThreshold: 10,
-				SuccessThreshold: 5,
-				Timeout:          2 * time.Second,
-				CooldownPeriod:   10 * time.Second,
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			repo := newMockRepository()
-			var service *CircuitBreakerService
-
-			if tt.customConfig != nil {
-				service = NewCircuitBreakerServiceWithConfig(repo, *tt.customConfig)
-			} else {
-				service = NewCircuitBreakerService(repo)
-			}
-
-			if service.repo != repo {
-				t.Errorf("expected repository to be set")
-			}
-			if service.cache == nil {
-				t.Errorf("expected cache to be initialized")
-			}
-			if service.config != tt.expectedConfig {
-				t.Errorf("expected config %+v, got %+v", tt.expectedConfig, service.config)
-			}
-		})
+func managerBreakerConfig() core.Config {
+	return core.Config{
+		FailureThreshold: 2,
+		SuccessThreshold: 2,
+		CooldownPeriod:   20 * time.Millisecond,
 	}
 }
 
-func TestDefaultConfig(t *testing.T) {
-	config := DefaultConfig()
-
-	tests := []struct {
-		name     string
-		actual   interface{}
-		expected interface{}
-	}{
-		{"failure threshold", config.FailureThreshold, 3},
-		{"success threshold", config.SuccessThreshold, 2},
-		{"timeout", config.Timeout, time.Second},
-		{"cooldown period", config.CooldownPeriod, 5 * time.Second},
+func TestNewManager(t *testing.T) {
+	manager, err := NewManager(DefaultOptions())
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if tt.actual != tt.expected {
-				t.Errorf("expected %s %v, got %v", tt.name, tt.expected, tt.actual)
-			}
-		})
+	if manager == nil {
+		t.Fatal("expected manager")
 	}
 }
 
-func TestExecute(t *testing.T) {
-	tests := []struct {
-		name          string
-		id            string
-		fn            func() error
-		setupRepo     func(*mockRepository)
-		expectError   bool
-		expectedError error
-		expectedCalls int
-		shouldExecute bool
-	}{
-		{
-			name: "success",
-			id:   "test-id",
-			fn: func() error {
-				return nil
-			},
-			expectedCalls: 2, // Create + Execute
-			shouldExecute: true,
-		},
-		{
-			name: "function error",
-			id:   "test-id",
-			fn: func() error {
-				return errors.New("test error")
-			},
-			expectError:   true,
-			expectedError: errors.New("test error"),
-			expectedCalls: 2,
-			shouldExecute: true,
-		},
-		{
-			name: "empty id",
-			id:   "",
-			fn: func() error {
-				return nil
-			},
-			expectError: true,
-		},
-		{
-			name: "repository find error",
-			id:   "test-id",
-			fn: func() error {
-				return nil
-			},
-			setupRepo: func(repo *mockRepository) {
-				repo.findError = errors.New("repository error")
-			},
-			expectError: true,
-		},
-		{
-			name: "save error does not affect execution",
-			id:   "test-id",
-			fn: func() error {
-				return nil
-			},
-			setupRepo: func(repo *mockRepository) {
-				// First execution to create the circuit breaker
-				service := NewCircuitBreakerService(repo)
-				service.Execute("test-id", func() error { return nil })
-				repo.saveError = errors.New("save error")
-			},
-			expectedCalls: 3, // Only the second call
-			shouldExecute: true,
-		},
+func TestExecuteCreatesAndCachesBreaker(t *testing.T) {
+	store := newMockStore()
+	manager, err := NewManager(Options{
+		BreakerConfig: managerBreakerConfig(),
+		Store:         store,
+	})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			repo := newMockRepository()
-			service := NewCircuitBreakerService(repo)
+	err = manager.Execute(context.Background(), "payments", func(context.Context) error { return nil })
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
 
-			if tt.setupRepo != nil {
-				tt.setupRepo(repo)
-			}
+	if store.saveCalls != 1 {
+		t.Fatalf("expected initial snapshot save, got %d", store.saveCalls)
+	}
 
-			executed := false
-			testFn := func() error {
-				executed = true
-				return tt.fn()
-			}
-
-			err := service.Execute(tt.id, testFn)
-
-			if tt.expectError && err == nil {
-				t.Errorf("expected error but got none")
-			}
-			if !tt.expectError && err != nil {
-				t.Errorf("expected no error but got %v", err)
-			}
-			if tt.expectedError != nil && err.Error() != tt.expectedError.Error() {
-				t.Errorf("expected error %v, got %v", tt.expectedError, err)
-			}
-			if tt.shouldExecute && !executed {
-				t.Errorf("expected function to be executed")
-			}
-			if tt.expectedCalls > 0 && repo.saveCalls != tt.expectedCalls {
-				t.Errorf("expected %d save calls, got %d", tt.expectedCalls, repo.saveCalls)
-			}
-		})
+	_, _, err = manager.getOrCreate(context.Background(), "payments")
+	if err != nil {
+		t.Fatalf("get or create: %v", err)
+	}
+	if store.loadCalls != 1 {
+		t.Fatalf("expected a single load call, got %d", store.loadCalls)
 	}
 }
 
-func TestExecuteWithContext(t *testing.T) {
-	tests := []struct {
-		name          string
-		timeout       time.Duration
-		fnDuration    time.Duration
-		expectTimeout bool
-	}{
-		{
-			name:          "successful execution within timeout",
-			timeout:       100 * time.Millisecond,
-			fnDuration:    10 * time.Millisecond,
-			expectTimeout: false,
-		},
-		{
-			name:          "timeout exceeded",
-			timeout:       50 * time.Millisecond,
-			fnDuration:    100 * time.Millisecond,
-			expectTimeout: true,
-		},
+func TestPersistOnStateTransitionOnly(t *testing.T) {
+	store := newMockStore()
+	manager, err := NewManager(Options{
+		BreakerConfig: managerBreakerConfig(),
+		Store:         store,
+		PersistPolicy: PersistOnStateChange,
+	})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			repo := newMockRepository()
-			service := NewCircuitBreakerService(repo)
+	_ = manager.Execute(context.Background(), "db", func(context.Context) error { return nil })
+	firstSaveCount := store.saveCalls
 
-			ctx, cancel := context.WithTimeout(context.Background(), tt.timeout)
-			defer cancel()
+	_ = manager.Execute(context.Background(), "db", func(context.Context) error { return errors.New("boom") })
+	if store.saveCalls != firstSaveCount {
+		t.Fatalf("expected no save without state transition, got %d saves", store.saveCalls)
+	}
 
-			err := service.ExecuteWithContext(ctx, "test-id", func() error {
-				time.Sleep(tt.fnDuration)
-				return nil
-			})
-
-			if tt.expectTimeout && err != core.ErrTimeout {
-				t.Errorf("expected timeout error, got %v", err)
-			}
-			if !tt.expectTimeout && err != nil {
-				t.Errorf("expected no error, got %v", err)
-			}
-		})
+	_ = manager.Execute(context.Background(), "db", func(context.Context) error { return errors.New("boom") })
+	if store.saveCalls != firstSaveCount+1 {
+		t.Fatalf("expected save on open transition, got %d saves", store.saveCalls)
 	}
 }
 
-func TestStateOperations(t *testing.T) {
-	tests := []struct {
-		name          string
-		id            string
-		operation     string
-		expectError   bool
-		expectedState core.State
-	}{
-		{
-			name:          "get initial state",
-			id:            "test-id",
-			operation:     "getState",
-			expectedState: core.StateClosed,
-		},
-		{
-			name:          "force open",
-			id:            "test-id",
-			operation:     "forceOpen",
-			expectedState: core.StateOpen,
-		},
-		{
-			name:          "force close",
-			id:            "test-id",
-			operation:     "forceClose",
-			expectedState: core.StateClosed,
-		},
-		{
-			name:        "empty id",
-			id:          "",
-			operation:   "getState",
-			expectError: true,
-		},
+func TestPersistAlways(t *testing.T) {
+	store := newMockStore()
+	manager, err := NewManager(Options{
+		BreakerConfig: managerBreakerConfig(),
+		Store:         store,
+		PersistPolicy: PersistAlways,
+	})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			repo := newMockRepository()
-			service := NewCircuitBreakerService(repo)
+	if err := manager.Execute(context.Background(), "search", func(context.Context) error { return nil }); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if err := manager.Execute(context.Background(), "search", func(context.Context) error { return nil }); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
 
-			var err error
-			switch tt.operation {
-			case "getState":
-				_, err = service.GetState(tt.id)
-			case "forceOpen":
-				err = service.ForceOpen(tt.id)
-			case "forceClose":
-				err = service.ForceClose(tt.id)
-			}
-
-			if tt.expectError && err == nil {
-				t.Errorf("expected error but got none")
-			}
-			if !tt.expectError && err != nil {
-				t.Errorf("expected no error but got %v", err)
-			}
-
-			if !tt.expectError && tt.expectedState.String() != "" {
-				state, _ := service.GetState(tt.id)
-				if state != tt.expectedState {
-					t.Errorf("expected state %v, got %v", tt.expectedState, state)
-				}
-			}
-		})
+	if store.saveCalls < 2 {
+		t.Fatalf("expected save on each execution, got %d", store.saveCalls)
 	}
 }
 
-func TestCreateCircuitBreaker(t *testing.T) {
-	tests := []struct {
-		name        string
-		id          string
-		config      Config
-		expectError bool
-	}{
-		{
-			name:   "valid creation",
-			id:     "test-id",
-			config: DefaultConfig(),
-		},
-		{
-			name:        "empty id",
-			id:          "",
-			config:      DefaultConfig(),
-			expectError: true,
-		},
-		{
-			name: "invalid config - zero failure threshold",
-			id:   "test-id",
-			config: Config{
-				FailureThreshold: 0,
-				SuccessThreshold: 2,
-				Timeout:          time.Second,
-				CooldownPeriod:   5 * time.Second,
-			},
-			expectError: true,
-		},
+func TestForceOpenAndClose(t *testing.T) {
+	manager, err := NewManager(Options{BreakerConfig: managerBreakerConfig()})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			repo := newMockRepository()
-			service := NewCircuitBreakerService(repo)
+	if err := manager.ForceOpen(context.Background(), "api"); err != nil {
+		t.Fatalf("force open: %v", err)
+	}
 
-			err := service.CreateCircuitBreaker(tt.id, tt.config)
+	state, err := manager.State(context.Background(), "api")
+	if err != nil {
+		t.Fatalf("state: %v", err)
+	}
+	if state != core.StateOpen {
+		t.Fatalf("expected open, got %s", state)
+	}
 
-			if tt.expectError && err == nil {
-				t.Errorf("expected error but got none")
-			}
-			if !tt.expectError && err != nil {
-				t.Errorf("expected no error but got %v", err)
-			}
+	if err := manager.ForceClose(context.Background(), "api"); err != nil {
+		t.Fatalf("force close: %v", err)
+	}
 
-			if !tt.expectError {
-				service.mu.RLock()
-				_, exists := service.cache[tt.id]
-				service.mu.RUnlock()
-
-				if !exists {
-					t.Errorf("expected circuit breaker to be cached")
-				}
-				if repo.saveCalls != 1 {
-					t.Errorf("expected 1 save call, got %d", repo.saveCalls)
-				}
-			}
-		})
+	state, err = manager.State(context.Background(), "api")
+	if err != nil {
+		t.Fatalf("state: %v", err)
+	}
+	if state != core.StateClosed {
+		t.Fatalf("expected closed, got %s", state)
 	}
 }
 
-func TestDeleteCircuitBreaker(t *testing.T) {
-	tests := []struct {
-		name        string
-		setupRepo   func(*mockRepository)
-		id          string
-		expectError bool
-	}{
-		{
-			name: "successful deletion",
-			setupRepo: func(repo *mockRepository) {
-				service := NewCircuitBreakerService(repo)
-				service.CreateCircuitBreaker("test-id", DefaultConfig())
-			},
-			id: "test-id",
-		},
-		{
-			name: "repository error",
-			setupRepo: func(repo *mockRepository) {
-				repo.deleteError = errors.New("delete error")
-			},
-			id:          "test-id",
-			expectError: true,
-		},
+func TestCreateWithCustomConfig(t *testing.T) {
+	manager, err := NewManager(Options{BreakerConfig: managerBreakerConfig()})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			repo := newMockRepository()
-			service := NewCircuitBreakerService(repo)
+	custom := core.Config{
+		FailureThreshold: 3,
+		SuccessThreshold: 1,
+		CooldownPeriod:   time.Second,
+	}
+	cb, err := manager.Create(context.Background(), "worker", custom)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
 
-			if tt.setupRepo != nil {
-				tt.setupRepo(repo)
-			}
-
-			err := service.DeleteCircuitBreaker(tt.id)
-
-			if tt.expectError && err == nil {
-				t.Errorf("expected error but got none")
-			}
-			if !tt.expectError && err != nil {
-				t.Errorf("expected no error but got %v", err)
-			}
-
-			if !tt.expectError {
-				service.mu.RLock()
-				_, exists := service.cache[tt.id]
-				service.mu.RUnlock()
-
-				if exists {
-					t.Errorf("expected circuit breaker to be removed from cache")
-				}
-			}
-		})
+	if cb.Config() != custom {
+		t.Fatalf("expected custom config %+v, got %+v", custom, cb.Config())
 	}
 }
 
-func TestListCircuitBreakers(t *testing.T) {
-	tests := []struct {
-		name        string
-		setupRepo   func(*mockRepository, *CircuitBreakerService)
-		expectError bool
-		expectedLen int
-	}{
-		{
-			name: "list multiple circuit breakers",
-			setupRepo: func(repo *mockRepository, service *CircuitBreakerService) {
-				service.CreateCircuitBreaker("id1", DefaultConfig())
-				service.CreateCircuitBreaker("id2", DefaultConfig())
-			},
-			expectedLen: 2,
-		},
-		{
-			name: "repository error",
-			setupRepo: func(repo *mockRepository, service *CircuitBreakerService) {
-				repo.listError = errors.New("list error")
-			},
-			expectError: true,
-		},
+func TestDeleteAndList(t *testing.T) {
+	store := newMockStore()
+	manager, err := NewManager(Options{
+		BreakerConfig: managerBreakerConfig(),
+		Store:         store,
+	})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			repo := newMockRepository()
-			service := NewCircuitBreakerService(repo)
+	if _, err := manager.Create(context.Background(), "a", managerBreakerConfig()); err != nil {
+		t.Fatalf("create a: %v", err)
+	}
+	if _, err := manager.Create(context.Background(), "b", managerBreakerConfig()); err != nil {
+		t.Fatalf("create b: %v", err)
+	}
 
-			if tt.setupRepo != nil {
-				tt.setupRepo(repo, service)
-			}
+	ids, err := manager.List(context.Background())
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(ids) != 2 {
+		t.Fatalf("expected 2 ids, got %d", len(ids))
+	}
 
-			ids, err := service.ListCircuitBreakers()
-
-			if tt.expectError && err == nil {
-				t.Errorf("expected error but got none")
-			}
-			if !tt.expectError && err != nil {
-				t.Errorf("expected no error but got %v", err)
-			}
-			if !tt.expectError && len(ids) != tt.expectedLen {
-				t.Errorf("expected %d IDs, got %d", tt.expectedLen, len(ids))
-			}
-		})
+	if err := manager.Delete(context.Background(), "a"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if store.deleteCalls != 1 {
+		t.Fatalf("expected delete to hit store once, got %d", store.deleteCalls)
 	}
 }
 
 func TestHealthCheck(t *testing.T) {
-	tests := []struct {
-		name        string
-		setupRepo   func(*mockRepository)
-		expectError bool
-	}{
-		{
-			name: "healthy",
-		},
-		{
-			name: "repository error",
-			setupRepo: func(repo *mockRepository) {
-				repo.listError = errors.New("repository down")
-			},
-			expectError: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			repo := newMockRepository()
-			service := NewCircuitBreakerService(repo)
-
-			if tt.setupRepo != nil {
-				tt.setupRepo(repo)
-			}
-
-			err := service.HealthCheck()
-
-			if tt.expectError && err == nil {
-				t.Errorf("expected error but got none")
-			}
-			if !tt.expectError && err != nil {
-				t.Errorf("expected no error but got %v", err)
-			}
-			if repo.listCalls != 1 {
-				t.Errorf("expected 1 list call, got %d", repo.listCalls)
-			}
-		})
-	}
-}
-
-func TestConcurrentAccess(t *testing.T) {
-	repo := newMockRepository()
-	service := NewCircuitBreakerService(repo)
-
-	var wg sync.WaitGroup
-	numGoroutines := 100
-	numOperations := 10
-
-	for i := 0; i < numGoroutines; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			cbID := fmt.Sprintf("cb-%d", id%5)
-
-			for j := 0; j < numOperations; j++ {
-				service.Execute(cbID, func() error {
-					if j%3 == 0 {
-						return errors.New("test error")
-					}
-					return nil
-				})
-			}
-		}(i)
-	}
-
-	wg.Wait()
-
-	// Verify service is still functional
-	err := service.Execute("test-concurrent", func() error {
-		return nil
+	store := newMockStore()
+	manager, err := NewManager(Options{
+		BreakerConfig: managerBreakerConfig(),
+		Store:         store,
 	})
 	if err != nil {
-		t.Errorf("service should still be functional after concurrent access, got error: %v", err)
+		t.Fatalf("new manager: %v", err)
+	}
+
+	if err := manager.HealthCheck(context.Background()); err != nil {
+		t.Fatalf("health check: %v", err)
+	}
+	if store.listCalls != 1 {
+		t.Fatalf("expected list to be called once, got %d", store.listCalls)
 	}
 }
 
-func TestUtilityMethods(t *testing.T) {
-	repo := newMockRepository()
-	service := NewCircuitBreakerService(repo)
-
-	t.Run("get and update config", func(t *testing.T) {
-		newConfig := Config{
-			FailureThreshold: 10,
-			SuccessThreshold: 5,
-			Timeout:          3 * time.Second,
-			CooldownPeriod:   15 * time.Second,
-		}
-
-		service.UpdateConfig(newConfig)
-		currentConfig := service.GetConfig()
-
-		if currentConfig != newConfig {
-			t.Errorf("expected config %+v, got %+v", newConfig, currentConfig)
-		}
+func BenchmarkManagerExecuteHotPath(b *testing.B) {
+	manager, err := NewManager(Options{
+		BreakerConfig: core.Config{
+			FailureThreshold: 5,
+			SuccessThreshold: 2,
+			CooldownPeriod:   time.Minute,
+		},
+		PersistPolicy: PersistNever,
 	})
+	if err != nil {
+		b.Fatalf("new manager: %v", err)
+	}
 
-	t.Run("clear cache", func(t *testing.T) {
-		service.Execute("id1", func() error { return nil })
-		service.Execute("id2", func() error { return nil })
+	ctx := context.Background()
+	if err := manager.Execute(ctx, "payments", func(context.Context) error { return nil }); err != nil {
+		b.Fatalf("warm manager: %v", err)
+	}
 
-		service.ClearCache()
+	b.ReportAllocs()
+	b.ResetTimer()
 
-		service.mu.RLock()
-		cacheSize := len(service.cache)
-		service.mu.RUnlock()
-
-		if cacheSize != 0 {
-			t.Errorf("expected empty cache, got %d entries", cacheSize)
+	for i := 0; i < b.N; i++ {
+		if err := manager.Execute(ctx, "payments", func(context.Context) error { return nil }); err != nil {
+			b.Fatalf("execute: %v", err)
 		}
-	})
-
-	t.Run("get stats", func(t *testing.T) {
-		service.Execute("stats-test", func() error { return nil })
-		service.Execute("stats-test", func() error { return errors.New("test error") })
-
-		stats, err := service.GetStats("stats-test")
-		if err != nil {
-			t.Errorf("expected no error, got %v", err)
-		}
-		if stats.State != core.StateClosed {
-			t.Errorf("expected state CLOSED, got %v", stats.State)
-		}
-		if stats.SuccessCount != 1 {
-			t.Errorf("expected success count 1, got %d", stats.SuccessCount)
-		}
-	})
+	}
 }
 
-// Benchmark tests
-func BenchmarkServiceExecute(b *testing.B) {
-	repo := newMockRepository()
-	service := NewCircuitBreakerService(repo)
-
-	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		i := 0
-		for pb.Next() {
-			service.Execute("bench-test", func() error {
-				i++
-				return nil
-			})
-		}
+func BenchmarkManagerExecutePersistAlways(b *testing.B) {
+	store := newMockStore()
+	manager, err := NewManager(Options{
+		BreakerConfig: core.Config{
+			FailureThreshold: 5,
+			SuccessThreshold: 2,
+			CooldownPeriod:   time.Minute,
+		},
+		Store:         store,
+		PersistPolicy: PersistAlways,
 	})
-}
+	if err != nil {
+		b.Fatalf("new manager: %v", err)
+	}
 
-func BenchmarkServiceExecuteWithCaching(b *testing.B) {
-	repo := newMockRepository()
-	service := NewCircuitBreakerService(repo)
+	ctx := context.Background()
+	if err := manager.Execute(ctx, "payments", func(context.Context) error { return nil }); err != nil {
+		b.Fatalf("warm manager: %v", err)
+	}
 
-	// Pre-warm the cache
-	service.Execute("bench-test", func() error { return nil })
-
+	b.ReportAllocs()
 	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			service.Execute("bench-test", func() error {
-				return nil
-			})
+
+	for i := 0; i < b.N; i++ {
+		if err := manager.Execute(ctx, "payments", func(context.Context) error { return nil }); err != nil {
+			b.Fatalf("execute: %v", err)
 		}
-	})
+	}
 }
