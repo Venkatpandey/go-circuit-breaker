@@ -9,6 +9,17 @@
 
 The project ships one runnable demo under `cmd/http-demo` and keeps Redis out of the hot path by default.
 
+## Features
+
+- ⚡ Fast local in-memory breaker path with low overhead.
+- 🧠 Context-first execution API (`Execute(ctx, fn)`).
+- 🔒 Strict half-open probe control (single probe in flight).
+- 📡 Event hooks for transitions, outcomes, and internal lifecycle points.
+- 📈 Optional Prometheus observer with explicit collector registration.
+- 🧱 Optional Redis snapshot persistence with configurable write policy.
+- 🧪 Unit, race, integration, and benchmark workflows.
+- 📚 GoDoc-friendly exported API comments and package docs.
+
 ## Why local-first
 
 The primary production model is one breaker per process protecting the dependency that process calls.
@@ -24,6 +35,7 @@ Redis is supported as an **optional adapter** for snapshots, state export, and d
 - `core`: breaker state machine, config, execution API, stats, snapshots
 - `service`: named breaker manager and optional persistence policy
 - `adapters`: optional integrations such as Redis snapshot storage
+- `observability/prometheus`: optional Prometheus observer built on event hooks
 - `cmd/http-demo`: runnable HTTP demo
 
 ## Get started
@@ -74,8 +86,8 @@ import (
 	"errors"
 	"time"
 
-	"go-circuit-breaker/core"
-	"go-circuit-breaker/service"
+	"github.com/Venkatpandey/go-circuit-breaker/core"
+	"github.com/Venkatpandey/go-circuit-breaker/service"
 )
 
 func main() {
@@ -116,6 +128,72 @@ The public API is **context-first**.
 - `(*service.Manager).Execute(ctx, id, fn)` manages named breakers without requiring any external store.
 
 The library does not spawn goroutines around your operation. If you configure `RequestTimeout`, the library derives a child context and passes it to your function. Your dependency code must honor that context for cancellation to take effect.
+
+## Observability
+
+The manager supports synchronous event hooks so you can plug in metrics, logs, and alerts without forcing any telemetry dependency into the core hot path.
+
+Event API highlights:
+
+- `service.Observer` receives `service.Event` callbacks.
+- Events include internal lifecycle points (`allow_granted`, `allow_denied`, `probe_started`, `execution_finished`, `state_transition`).
+- Event payload includes breaker ID, state, before/after state, outcome, timestamp, and error.
+- Observer failures are isolated from breaker logic. You can attach `ObserverErrHandler` to capture callback panics.
+
+Minimal hook example:
+
+```go
+manager, err := service.NewManager(service.Options{
+	BreakerConfig: core.DefaultConfig(),
+	Observer: service.ObserverFunc(func(_ context.Context, event service.Event) {
+		// Keep this callback fast and non-blocking.
+		fmt.Printf("event=%s breaker=%s state=%s outcome=%s\n",
+			event.Type, event.BreakerID, event.State, event.Outcome)
+	}),
+	ObserverErrHandler: func(err error) {
+		// Optional: report observer callback failures.
+	},
+})
+```
+
+### Prometheus integration (optional)
+
+Use `observability/prometheus` if you want ready-to-register collectors:
+
+```go
+obs := prometheusobs.NewObserver(prometheusobs.DefaultConfig())
+for _, collector := range obs.Collectors() {
+	prometheus.MustRegister(collector)
+}
+
+manager, err := service.NewManager(service.Options{
+	BreakerConfig: core.DefaultConfig(),
+	Observer:      obs,
+})
+```
+
+Default metrics:
+
+- `gcb_circuit_breaker_events_total{breaker_id,event_type,state,outcome}`
+- `gcb_circuit_breaker_executions_total{breaker_id,state,outcome}`
+- `gcb_circuit_breaker_state{breaker_id,state}`
+
+Cardinality note:
+
+- Labels include breaker ID, state, and outcome by default.
+- Keep breaker IDs stable and bounded. Avoid per-user or per-request IDs.
+
+Ready-to-use files:
+
+- `examples/observability/prometheus-alerts.yml`
+- `examples/observability/grafana-dashboard.json`
+- `examples/observability/README.md`
+
+Alert/dashboard ideas:
+
+- Alert when execution `outcome="blocked_open"` rate spikes.
+- Alert when `state="OPEN"` remains at `1` for longer than expected cooldown windows.
+- Dashboard transition and outcome rates per breaker ID.
 
 ## Why use this over `sony/gobreaker`?
 
@@ -195,6 +273,25 @@ make benchmark
 make demo
 ```
 
+## GoDoc usage
+
+Quick ways to use docs locally:
+
+```bash
+go doc github.com/Venkatpandey/go-circuit-breaker/core
+go doc github.com/Venkatpandey/go-circuit-breaker/service
+go doc github.com/Venkatpandey/go-circuit-breaker/service.Manager.Execute
+```
+
+Browse package docs in a local web UI:
+
+```bash
+go install golang.org/x/pkgsite/cmd/pkgsite@latest
+pkgsite
+```
+
+Then open `http://localhost:8080/github.com/Venkatpandey/go-circuit-breaker`.
+
 Optional Redis workflows:
 
 ```bash
@@ -229,15 +326,17 @@ Latest local benchmark sample:
 - Command: `go test -run=^$ -bench=. -benchmem ./core ./service`
 
 ```text
-pkg: go-circuit-breaker/core
-BenchmarkCircuitBreakerExecuteSuccess-8          4328516   309.8 ns/op   48 B/op   2 allocs/op
-BenchmarkCircuitBreakerAllowCompleteSuccess-8    3465748   289.0 ns/op   48 B/op   2 allocs/op
-BenchmarkCircuitBreakerOpenFastFail-8           10541118   113.8 ns/op    0 B/op   0 allocs/op
-BenchmarkCircuitBreakerExecuteParallel-8         2109230   568.9 ns/op   48 B/op   2 allocs/op
+pkg: github.com/Venkatpandey/go-circuit-breaker/core
+BenchmarkCircuitBreakerExecuteSuccess-8          4507650   254.9 ns/op   48 B/op   2 allocs/op
+BenchmarkCircuitBreakerAllowCompleteSuccess-8    4879486   245.3 ns/op   48 B/op   2 allocs/op
+BenchmarkCircuitBreakerOpenFastFail-8           10352617   115.7 ns/op    0 B/op   0 allocs/op
+BenchmarkCircuitBreakerExecuteParallel-8         2014198   675.4 ns/op   48 B/op   2 allocs/op
 
-pkg: go-circuit-breaker/service
-BenchmarkManagerExecuteHotPath-8                 3512440   365.5 ns/op   48 B/op   2 allocs/op
-BenchmarkManagerExecutePersistAlways-8           2597545   387.5 ns/op   48 B/op   2 allocs/op
+pkg: github.com/Venkatpandey/go-circuit-breaker/service
+BenchmarkManagerExecuteHotPath-8                 2052726   589.9 ns/op   48 B/op   2 allocs/op
+BenchmarkManagerExecutePersistAlways-8           1855582   654.6 ns/op   48 B/op   2 allocs/op
+BenchmarkManagerExecuteWithNoopObserver-8        1841437   650.0 ns/op   48 B/op   2 allocs/op
+BenchmarkManagerExecuteWithPromObserver-8         891808  1333.0 ns/op   48 B/op   2 allocs/op
 ```
 
 These numbers are intended as a reference point for the in-memory hot path. Actual results will vary by CPU, Go version, OS, and whether your production code adds network calls, tracing, logging, or persistence on top.
@@ -254,3 +353,4 @@ These numbers are intended as a reference point for the in-memory hot path. Actu
 - License: MIT, see `LICENSE`
 - Contribution notes: see `CONTRIBUTING.md`
 - CI: see `.github/workflows/ci.yml`
+- Documentation style: exported APIs should include GoDoc comments and long files should use lightweight section headers.

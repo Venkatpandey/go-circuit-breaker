@@ -10,8 +10,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"go-circuit-breaker/core"
-	"go-circuit-breaker/service"
+	"github.com/Venkatpandey/go-circuit-breaker/core"
+	"github.com/Venkatpandey/go-circuit-breaker/service"
 )
 
 func main() {

@@ -24,3 +24,6 @@ Use `make test-integration` when you want to run the Redis adapter suite.
 - Do not add library logging side effects.
 - Keep the half-open concurrency contract explicit and covered by tests.
 - When changing docs, make sure the README matches the code and build targets exactly.
+- Add GoDoc comments for exported package/type/function/method changes.
+- Use lightweight section-header comments in long files to improve scanability.
+- Keep observer callbacks synchronous and cheap; heavy work should be offloaded by the observer implementation.

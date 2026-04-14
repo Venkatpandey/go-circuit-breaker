@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"go-circuit-breaker/core"
+	"github.com/Venkatpandey/go-circuit-breaker/core"
 
 	"github.com/go-redis/redis/v8"
 )
@@ -19,12 +19,14 @@ const (
 	defaultKeyPrefix    = "circuit_breaker:"
 )
 
+// RedisStoreConfig customizes Redis snapshot storage behavior.
 type RedisStoreConfig struct {
 	Timeout   time.Duration
 	KeyPrefix string
 	ScanCount int64
 }
 
+// DefaultRedisStoreConfig returns baseline Redis store settings.
 func DefaultRedisStoreConfig() RedisStoreConfig {
 	return RedisStoreConfig{
 		Timeout:   defaultRedisTimeout,
@@ -33,11 +35,13 @@ func DefaultRedisStoreConfig() RedisStoreConfig {
 	}
 }
 
+// RedisStore implements ports.SnapshotStore on Redis.
 type RedisStore struct {
 	client *redis.Client
 	config RedisStoreConfig
 }
 
+// NewRedisStore builds a Redis snapshot store from a client and config.
 func NewRedisStore(client *redis.Client, config RedisStoreConfig) (*RedisStore, error) {
 	if client == nil {
 		return nil, errors.New("redis client cannot be nil")
@@ -58,6 +62,7 @@ func NewRedisStore(client *redis.Client, config RedisStoreConfig) (*RedisStore, 
 	}, nil
 }
 
+// Load fetches a snapshot by breaker ID.
 func (r *RedisStore) Load(ctx context.Context, id string) (*core.Snapshot, error) {
 	if id == "" {
 		return nil, errors.New("circuit breaker id cannot be empty")
@@ -82,6 +87,7 @@ func (r *RedisStore) Load(ctx context.Context, id string) (*core.Snapshot, error
 	return &snapshot, nil
 }
 
+// Save stores a snapshot for a breaker ID.
 func (r *RedisStore) Save(ctx context.Context, id string, snapshot core.Snapshot) error {
 	if id == "" {
 		return errors.New("circuit breaker id cannot be empty")
@@ -102,6 +108,7 @@ func (r *RedisStore) Save(ctx context.Context, id string, snapshot core.Snapshot
 	return nil
 }
 
+// Delete removes snapshot data for a breaker ID.
 func (r *RedisStore) Delete(ctx context.Context, id string) error {
 	if id == "" {
 		return errors.New("circuit breaker id cannot be empty")
@@ -117,6 +124,7 @@ func (r *RedisStore) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
+// List scans and returns all breaker IDs known in Redis.
 func (r *RedisStore) List(ctx context.Context) ([]string, error) {
 	ctx, cancel := r.withTimeout(ctx)
 	defer cancel()
@@ -142,12 +150,14 @@ func (r *RedisStore) List(ctx context.Context) ([]string, error) {
 	return ids, nil
 }
 
+// Ping checks Redis connectivity.
 func (r *RedisStore) Ping(ctx context.Context) error {
 	ctx, cancel := r.withTimeout(ctx)
 	defer cancel()
 	return r.client.Ping(ctx).Err()
 }
 
+// Clear removes all breaker snapshots under configured prefix.
 func (r *RedisStore) Clear(ctx context.Context) error {
 	ids, err := r.List(ctx)
 	if err != nil {
@@ -167,6 +177,7 @@ func (r *RedisStore) Clear(ctx context.Context) error {
 	return r.client.Del(ctx, keys...).Err()
 }
 
+// Exists reports whether a breaker snapshot exists.
 func (r *RedisStore) Exists(ctx context.Context, id string) (bool, error) {
 	if id == "" {
 		return false, errors.New("circuit breaker id cannot be empty")

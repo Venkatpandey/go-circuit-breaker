@@ -8,11 +8,15 @@ import (
 )
 
 var (
-	ErrCircuitOpen   = errors.New("circuit breaker is open")
-	ErrInvalidState  = errors.New("invalid state")
+	// ErrCircuitOpen is returned when a request is blocked by OPEN/HALF_OPEN rules.
+	ErrCircuitOpen = errors.New("circuit breaker is open")
+	// ErrInvalidState is returned when restoring unsupported state values.
+	ErrInvalidState = errors.New("invalid state")
+	// ErrInvalidConfig is returned when breaker configuration is invalid.
 	ErrInvalidConfig = errors.New("invalid configuration")
 )
 
+// State represents the current circuit breaker state.
 type State int
 
 const (
@@ -21,6 +25,7 @@ const (
 	StateHalfOpen
 )
 
+// String returns a stable uppercase string for state.
 func (s State) String() string {
 	switch s {
 	case StateClosed:
@@ -34,6 +39,7 @@ func (s State) String() string {
 	}
 }
 
+// Config controls breaker thresholds and execution timeout behavior.
 type Config struct {
 	FailureThreshold int           `json:"failure_threshold"`
 	SuccessThreshold int           `json:"success_threshold"`
@@ -41,6 +47,7 @@ type Config struct {
 	RequestTimeout   time.Duration `json:"request_timeout"`
 }
 
+// DefaultConfig returns safe baseline defaults for service use.
 func DefaultConfig() Config {
 	return Config{
 		FailureThreshold: 5,
@@ -50,6 +57,7 @@ func DefaultConfig() Config {
 	}
 }
 
+// Validate verifies that config values are internally consistent.
 func (c Config) Validate() error {
 	switch {
 	case c.FailureThreshold <= 0:
@@ -65,6 +73,7 @@ func (c Config) Validate() error {
 	}
 }
 
+// Stats holds public breaker counters and timing fields.
 type Stats struct {
 	State                 State     `json:"state"`
 	ConsecutiveFailures   int       `json:"consecutive_failures"`
@@ -74,13 +83,18 @@ type Stats struct {
 	HalfOpenProbeInFlight bool      `json:"half_open_probe_in_flight"`
 }
 
+// Snapshot captures a serializable breaker configuration and state.
 type Snapshot struct {
 	Config Config `json:"config"`
 	Stats  Stats  `json:"stats"`
 }
 
+// Completion marks a previously allowed request as success/failure.
 type Completion func(err error)
 
+// --- Breaker state container ---
+
+// CircuitBreaker is a thread-safe in-memory circuit breaker.
 type CircuitBreaker struct {
 	mu                    sync.RWMutex
 	config                Config
@@ -92,6 +106,9 @@ type CircuitBreaker struct {
 	halfOpenProbeInFlight bool
 }
 
+// --- Construction ---
+
+// NewCircuitBreaker creates a breaker from config.
 func NewCircuitBreaker(config Config) (*CircuitBreaker, error) {
 	if err := config.Validate(); err != nil {
 		return nil, err
@@ -105,6 +122,7 @@ func NewCircuitBreaker(config Config) (*CircuitBreaker, error) {
 	}, nil
 }
 
+// NewCircuitBreakerFromSnapshot reconstructs a breaker from persisted snapshot data.
 func NewCircuitBreakerFromSnapshot(snapshot Snapshot) (*CircuitBreaker, error) {
 	if err := snapshot.Config.Validate(); err != nil {
 		return nil, err
@@ -130,6 +148,9 @@ func NewCircuitBreakerFromSnapshot(snapshot Snapshot) (*CircuitBreaker, error) {
 	return cb, nil
 }
 
+// --- Execution path ---
+
+// Execute runs fn under breaker admission and timeout policy.
 func (cb *CircuitBreaker) Execute(ctx context.Context, fn func(context.Context) error) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -155,6 +176,7 @@ func (cb *CircuitBreaker) Execute(ctx context.Context, fn func(context.Context) 
 	return err
 }
 
+// Allow performs admission and returns a completion callback for the request.
 func (cb *CircuitBreaker) Allow() (Completion, error) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
@@ -185,12 +207,16 @@ func (cb *CircuitBreaker) Allow() (Completion, error) {
 	return cb.newCompletion(true), nil
 }
 
+// --- Public inspection and controls ---
+
+// State returns current breaker state.
 func (cb *CircuitBreaker) State() State {
 	cb.mu.RLock()
 	defer cb.mu.RUnlock()
 	return cb.state
 }
 
+// Stats returns a copy of current breaker statistics.
 func (cb *CircuitBreaker) Stats() Stats {
 	cb.mu.RLock()
 	defer cb.mu.RUnlock()
@@ -205,6 +231,7 @@ func (cb *CircuitBreaker) Stats() Stats {
 	}
 }
 
+// Snapshot returns a serializable copy of breaker state.
 func (cb *CircuitBreaker) Snapshot() Snapshot {
 	cb.mu.RLock()
 	defer cb.mu.RUnlock()
@@ -222,12 +249,14 @@ func (cb *CircuitBreaker) Snapshot() Snapshot {
 	}
 }
 
+// Config returns the active breaker configuration.
 func (cb *CircuitBreaker) Config() Config {
 	cb.mu.RLock()
 	defer cb.mu.RUnlock()
 	return cb.config
 }
 
+// ForceOpen forces breaker state to OPEN and resets probe flags.
 func (cb *CircuitBreaker) ForceOpen() {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
@@ -240,6 +269,7 @@ func (cb *CircuitBreaker) ForceOpen() {
 	cb.halfOpenProbeInFlight = false
 }
 
+// ForceClose forces breaker state to CLOSED and clears counters.
 func (cb *CircuitBreaker) ForceClose() {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
@@ -249,6 +279,8 @@ func (cb *CircuitBreaker) ForceClose() {
 	cb.consecutiveSuccesses = 0
 	cb.halfOpenProbeInFlight = false
 }
+
+// --- Internal state updates ---
 
 func (cb *CircuitBreaker) newCompletion(halfOpenProbe bool) Completion {
 	var once sync.Once

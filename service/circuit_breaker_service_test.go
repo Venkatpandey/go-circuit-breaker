@@ -3,11 +3,12 @@ package service
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"testing"
 	"time"
 
-	"go-circuit-breaker/core"
+	"github.com/Venkatpandey/go-circuit-breaker/core"
 )
 
 type mockStore struct {
@@ -275,6 +276,175 @@ func TestHealthCheck(t *testing.T) {
 	}
 }
 
+type recordingObserver struct {
+	mu     sync.Mutex
+	events []Event
+}
+
+func (o *recordingObserver) OnCircuitBreakerEvent(_ context.Context, event Event) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.events = append(o.events, event)
+}
+
+func (o *recordingObserver) snapshot() []Event {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	out := make([]Event, len(o.events))
+	copy(out, o.events)
+	return out
+}
+
+func TestEventOrderAndPayloadForOpenTransition(t *testing.T) {
+	observer := &recordingObserver{}
+	manager, err := NewManager(Options{
+		BreakerConfig: core.Config{
+			FailureThreshold: 1,
+			SuccessThreshold: 1,
+			CooldownPeriod:   time.Second,
+		},
+		Observer: observer,
+	})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	execErr := manager.Execute(context.Background(), "payments", func(context.Context) error {
+		return errors.New("boom")
+	})
+	if execErr == nil {
+		t.Fatal("expected execution failure")
+	}
+
+	events := observer.snapshot()
+	if len(events) != 3 {
+		t.Fatalf("expected 3 events, got %d", len(events))
+	}
+	if events[0].Type != EventAllowGranted {
+		t.Fatalf("expected first event allow granted, got %q", events[0].Type)
+	}
+	if events[1].Type != EventExecutionFinished || events[1].Outcome != OutcomeFailure {
+		t.Fatalf("expected execution failure event, got type=%q outcome=%q", events[1].Type, events[1].Outcome)
+	}
+	if events[2].Type != EventStateTransition || events[2].Before != core.StateClosed || events[2].After != core.StateOpen {
+		t.Fatalf("unexpected transition event: %+v", events[2])
+	}
+}
+
+func TestAllowDeniedEmitsBlockedOpen(t *testing.T) {
+	observer := &recordingObserver{}
+	manager, err := NewManager(Options{
+		BreakerConfig: managerBreakerConfig(),
+		Observer:      observer,
+	})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	if err := manager.ForceOpen(context.Background(), "api"); err != nil {
+		t.Fatalf("force open: %v", err)
+	}
+	observer.events = nil
+
+	err = manager.Execute(context.Background(), "api", func(context.Context) error { return nil })
+	if !errors.Is(err, core.ErrCircuitOpen) {
+		t.Fatalf("expected circuit open error, got %v", err)
+	}
+
+	events := observer.snapshot()
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
+	}
+	if events[0].Type != EventAllowDenied || events[0].Outcome != OutcomeBlockedOpen {
+		t.Fatalf("unexpected allow denied event: %+v", events[0])
+	}
+	if events[1].Type != EventExecutionFinished || events[1].Outcome != OutcomeBlockedOpen {
+		t.Fatalf("unexpected execution event: %+v", events[1])
+	}
+}
+
+func TestProbeEventEmitted(t *testing.T) {
+	observer := &recordingObserver{}
+	manager, err := NewManager(Options{
+		BreakerConfig: core.Config{
+			FailureThreshold: 1,
+			SuccessThreshold: 2,
+			CooldownPeriod:   20 * time.Millisecond,
+		},
+		Observer: observer,
+	})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	if err := manager.ForceOpen(context.Background(), "svc"); err != nil {
+		t.Fatalf("force open: %v", err)
+	}
+	observer.events = nil
+	time.Sleep(30 * time.Millisecond)
+
+	if err := manager.Execute(context.Background(), "svc", func(context.Context) error { return nil }); err != nil {
+		t.Fatalf("execute probe: %v", err)
+	}
+
+	events := observer.snapshot()
+	hasProbe := false
+	for _, event := range events {
+		if event.Type == EventProbeStarted {
+			hasProbe = true
+			break
+		}
+	}
+	if !hasProbe {
+		t.Fatalf("expected probe event, got %+v", events)
+	}
+}
+
+func TestObserverPanicIsIsolated(t *testing.T) {
+	manager, err := NewManager(Options{
+		BreakerConfig: managerBreakerConfig(),
+		Observer: ObserverFunc(func(context.Context, Event) {
+			panic("observer panic")
+		}),
+	})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	if err := manager.Execute(context.Background(), "svc", func(context.Context) error { return nil }); err != nil {
+		t.Fatalf("observer panic should not affect execute, got %v", err)
+	}
+}
+
+func TestObserverPanicCallsErrorHandler(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		called bool
+	)
+
+	manager, err := NewManager(Options{
+		BreakerConfig: managerBreakerConfig(),
+		Observer: ObserverFunc(func(context.Context, Event) {
+			panic("observer panic")
+		}),
+		ObserverErrHandler: func(err error) {
+			mu.Lock()
+			defer mu.Unlock()
+			called = true
+		},
+	})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	_ = manager.Execute(context.Background(), "svc", func(context.Context) error { return nil })
+	mu.Lock()
+	defer mu.Unlock()
+	if !called {
+		t.Fatal("expected observer error handler to be called")
+	}
+}
+
 func BenchmarkManagerExecuteHotPath(b *testing.B) {
 	manager, err := NewManager(Options{
 		BreakerConfig: core.Config{
@@ -330,5 +500,49 @@ func BenchmarkManagerExecutePersistAlways(b *testing.B) {
 		if err := manager.Execute(ctx, "payments", func(context.Context) error { return nil }); err != nil {
 			b.Fatalf("execute: %v", err)
 		}
+	}
+}
+
+func BenchmarkManagerExecuteWithNoopObserver(b *testing.B) {
+	manager, err := NewManager(Options{
+		BreakerConfig: core.Config{
+			FailureThreshold: 5,
+			SuccessThreshold: 2,
+			CooldownPeriod:   time.Minute,
+		},
+		PersistPolicy: PersistNever,
+		Observer:      ObserverFunc(func(context.Context, Event) {}),
+	})
+	if err != nil {
+		b.Fatalf("new manager: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := manager.Execute(ctx, "payments", func(context.Context) error { return nil }); err != nil {
+		b.Fatalf("warm manager: %v", err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := manager.Execute(ctx, "payments", func(context.Context) error { return nil }); err != nil {
+			b.Fatalf("execute: %v", err)
+		}
+	}
+}
+
+func TestComposeObservers(t *testing.T) {
+	var out []string
+	o1 := ObserverFunc(func(_ context.Context, _ Event) { out = append(out, "one") })
+	o2 := ObserverFunc(func(_ context.Context, _ Event) { out = append(out, "two") })
+
+	composed := ComposeObservers(nil, o1, o2)
+	if composed == nil {
+		t.Fatal("expected composed observer")
+	}
+
+	composed.OnCircuitBreakerEvent(context.Background(), Event{})
+	if !slices.Equal(out, []string{"one", "two"}) {
+		t.Fatalf("unexpected observer call order: %v", out)
 	}
 }
