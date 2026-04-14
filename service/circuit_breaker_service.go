@@ -5,25 +5,35 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
-	"go-circuit-breaker/core"
-	"go-circuit-breaker/ports"
+	"github.com/Venkatpandey/go-circuit-breaker/core"
+	"github.com/Venkatpandey/go-circuit-breaker/ports"
 )
 
+// PersistPolicy controls when snapshots are written through the store.
 type PersistPolicy int
 
 const (
+	// PersistOnStateChange writes snapshots only when state changes.
 	PersistOnStateChange PersistPolicy = iota
+	// PersistAlways writes snapshots after every execution.
 	PersistAlways
+	// PersistNever disables snapshot persistence.
 	PersistNever
 )
 
+// Options configures a manager instance.
 type Options struct {
-	BreakerConfig core.Config
-	Store         ports.SnapshotStore
-	PersistPolicy PersistPolicy
+	BreakerConfig      core.Config
+	Store              ports.SnapshotStore
+	PersistPolicy      PersistPolicy
+	Observer           Observer
+	Observers          []Observer
+	ObserverErrHandler ObserverErrorHandler
 }
 
+// DefaultOptions returns a production-oriented default config.
 func DefaultOptions() Options {
 	return Options{
 		BreakerConfig: core.DefaultConfig(),
@@ -31,15 +41,22 @@ func DefaultOptions() Options {
 	}
 }
 
+// Manager owns named in-process circuit breakers and optional persistence.
 type Manager struct {
 	store         ports.SnapshotStore
 	breakerConfig core.Config
 	persistPolicy PersistPolicy
 
+	observers          []Observer
+	observerErrHandler ObserverErrorHandler
+
 	mu       sync.RWMutex
 	breakers map[string]*core.CircuitBreaker
 }
 
+// --- Construction ---
+
+// NewManager creates a manager with optional store and observers.
 func NewManager(options Options) (*Manager, error) {
 	if options.BreakerConfig == (core.Config{}) {
 		options.BreakerConfig = core.DefaultConfig()
@@ -48,23 +65,144 @@ func NewManager(options Options) (*Manager, error) {
 		return nil, err
 	}
 
+	observers := make([]Observer, 0, len(options.Observers)+1)
+	if options.Observer != nil {
+		observers = append(observers, options.Observer)
+	}
+	observers = append(observers, options.Observers...)
+	filtered := make([]Observer, 0, len(observers))
+	for _, observer := range observers {
+		if observer != nil {
+			filtered = append(filtered, observer)
+		}
+	}
+
 	return &Manager{
-		store:         options.Store,
-		breakerConfig: options.BreakerConfig,
-		persistPolicy: options.PersistPolicy,
-		breakers:      make(map[string]*core.CircuitBreaker),
+		store:              options.Store,
+		breakerConfig:      options.BreakerConfig,
+		persistPolicy:      options.PersistPolicy,
+		observers:          filtered,
+		observerErrHandler: options.ObserverErrHandler,
+		breakers:           make(map[string]*core.CircuitBreaker),
 	}, nil
 }
 
+// --- Execution and lifecycle API ---
+
+// Execute runs fn through the named breaker and emits observability events.
 func (m *Manager) Execute(ctx context.Context, id string, fn func(context.Context) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	cb, created, err := m.getOrCreate(ctx, id)
 	if err != nil {
 		return err
 	}
 
 	before := cb.State()
-	err = cb.Execute(ctx, fn)
+
+	if err := ctx.Err(); err != nil {
+		m.emit(ctx, Event{
+			Time:      time.Now(),
+			BreakerID: id,
+			Type:      EventExecutionFinished,
+			Before:    before,
+			After:     cb.State(),
+			State:     cb.State(),
+			Outcome:   classifyOutcome(err),
+			Err:       err,
+		})
+		return err
+	}
+
+	done, allowErr := cb.Allow()
+	if allowErr != nil {
+		now := time.Now()
+		state := cb.State()
+		m.emit(ctx, Event{
+			Time:      now,
+			BreakerID: id,
+			Type:      EventAllowDenied,
+			Before:    before,
+			After:     state,
+			State:     state,
+			Outcome:   classifyOutcome(allowErr),
+			Err:       allowErr,
+		})
+		m.emit(ctx, Event{
+			Time:      now,
+			BreakerID: id,
+			Type:      EventExecutionFinished,
+			Before:    before,
+			After:     state,
+			State:     state,
+			Outcome:   classifyOutcome(allowErr),
+			Err:       allowErr,
+		})
+		return allowErr
+	}
+
+	allowState := cb.State()
+	now := time.Now()
+	m.emit(ctx, Event{
+		Time:      now,
+		BreakerID: id,
+		Type:      EventAllowGranted,
+		Before:    before,
+		After:     allowState,
+		State:     allowState,
+		Outcome:   OutcomeUnknown,
+	})
+
+	if stats := cb.Stats(); stats.State == core.StateHalfOpen && stats.HalfOpenProbeInFlight {
+		m.emit(ctx, Event{
+			Time:      now,
+			BreakerID: id,
+			Type:      EventProbeStarted,
+			Before:    before,
+			After:     allowState,
+			State:     allowState,
+			Outcome:   OutcomeUnknown,
+		})
+	}
+
+	execCtx := ctx
+	cancel := func() {}
+	if timeout := cb.Config().RequestTimeout; timeout > 0 {
+		execCtx, cancel = context.WithTimeout(ctx, timeout)
+	}
+	defer cancel()
+
+	err = fn(execCtx)
+	done(err)
+
 	after := cb.State()
+	eventTime := time.Now()
+	outcome := classifyExecutionOutcome(ctx, execCtx, err)
+	m.emit(ctx, Event{
+		Time:      eventTime,
+		BreakerID: id,
+		Type:      EventExecutionFinished,
+		Before:    before,
+		After:     after,
+		State:     after,
+		Outcome:   outcome,
+		Err:       err,
+	})
+
+	if before != after {
+		m.emit(ctx, Event{
+			Time:      eventTime,
+			BreakerID: id,
+			Type:      EventStateTransition,
+			Before:    before,
+			After:     after,
+			State:     after,
+			Outcome:   outcome,
+			Err:       err,
+		})
+	}
 
 	if created {
 		return err
@@ -79,6 +217,7 @@ func (m *Manager) Execute(ctx context.Context, id string, fn func(context.Contex
 	return err
 }
 
+// Create initializes and stores a breaker with custom configuration.
 func (m *Manager) Create(ctx context.Context, id string, config core.Config) (*core.CircuitBreaker, error) {
 	if id == "" {
 		return nil, errors.New("circuit breaker id cannot be empty")
@@ -105,11 +244,13 @@ func (m *Manager) Create(ctx context.Context, id string, config core.Config) (*c
 	return cb, nil
 }
 
+// Get returns a named breaker, creating it on first access.
 func (m *Manager) Get(ctx context.Context, id string) (*core.CircuitBreaker, error) {
 	cb, _, err := m.getOrCreate(ctx, id)
 	return cb, err
 }
 
+// Stats returns breaker statistics for id.
 func (m *Manager) Stats(ctx context.Context, id string) (core.Stats, error) {
 	cb, _, err := m.getOrCreate(ctx, id)
 	if err != nil {
@@ -118,6 +259,7 @@ func (m *Manager) Stats(ctx context.Context, id string) (core.Stats, error) {
 	return cb.Stats(), nil
 }
 
+// State returns breaker state for id.
 func (m *Manager) State(ctx context.Context, id string) (core.State, error) {
 	cb, _, err := m.getOrCreate(ctx, id)
 	if err != nil {
@@ -126,13 +268,28 @@ func (m *Manager) State(ctx context.Context, id string) (core.State, error) {
 	return cb.State(), nil
 }
 
+// ForceOpen forces breaker state to OPEN.
 func (m *Manager) ForceOpen(ctx context.Context, id string) error {
 	cb, _, err := m.getOrCreate(ctx, id)
 	if err != nil {
 		return err
 	}
 
+	before := cb.State()
 	cb.ForceOpen()
+	after := cb.State()
+	if before != after {
+		m.emit(ctx, Event{
+			Time:      time.Now(),
+			BreakerID: id,
+			Type:      EventStateTransition,
+			Before:    before,
+			After:     after,
+			State:     after,
+			Outcome:   OutcomeUnknown,
+		})
+	}
+
 	if shouldSave(m.persistPolicy, false, core.StateClosed, core.StateOpen) {
 		return m.save(ctx, id, cb)
 	}
@@ -140,13 +297,28 @@ func (m *Manager) ForceOpen(ctx context.Context, id string) error {
 	return nil
 }
 
+// ForceClose forces breaker state to CLOSED.
 func (m *Manager) ForceClose(ctx context.Context, id string) error {
 	cb, _, err := m.getOrCreate(ctx, id)
 	if err != nil {
 		return err
 	}
 
+	before := cb.State()
 	cb.ForceClose()
+	after := cb.State()
+	if before != after {
+		m.emit(ctx, Event{
+			Time:      time.Now(),
+			BreakerID: id,
+			Type:      EventStateTransition,
+			Before:    before,
+			After:     after,
+			State:     after,
+			Outcome:   OutcomeUnknown,
+		})
+	}
+
 	if shouldSave(m.persistPolicy, false, core.StateOpen, core.StateClosed) {
 		return m.save(ctx, id, cb)
 	}
@@ -154,6 +326,7 @@ func (m *Manager) ForceClose(ctx context.Context, id string) error {
 	return nil
 }
 
+// Delete removes a breaker from memory and from the snapshot store.
 func (m *Manager) Delete(ctx context.Context, id string) error {
 	if id == "" {
 		return errors.New("circuit breaker id cannot be empty")
@@ -170,6 +343,7 @@ func (m *Manager) Delete(ctx context.Context, id string) error {
 	return m.store.Delete(ctx, id)
 }
 
+// List returns breaker IDs from store (if configured) or in-memory cache.
 func (m *Manager) List(ctx context.Context) ([]string, error) {
 	if m.store != nil {
 		return m.store.List(ctx)
@@ -185,12 +359,14 @@ func (m *Manager) List(ctx context.Context) ([]string, error) {
 	return ids, nil
 }
 
+// ClearCache resets in-memory breaker cache.
 func (m *Manager) ClearCache() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.breakers = make(map[string]*core.CircuitBreaker)
 }
 
+// HealthCheck verifies store connectivity.
 func (m *Manager) HealthCheck(ctx context.Context) error {
 	if m.store == nil {
 		return nil
@@ -200,6 +376,9 @@ func (m *Manager) HealthCheck(ctx context.Context) error {
 	return err
 }
 
+// --- Internal helpers ---
+
+// save persists breaker snapshot.
 func (m *Manager) save(ctx context.Context, id string, cb *core.CircuitBreaker) error {
 	if m.store == nil {
 		return nil
@@ -210,6 +389,7 @@ func (m *Manager) save(ctx context.Context, id string, cb *core.CircuitBreaker) 
 	return nil
 }
 
+// getOrCreate retrieves breaker from cache/store or creates a new one.
 func (m *Manager) getOrCreate(ctx context.Context, id string) (*core.CircuitBreaker, bool, error) {
 	if id == "" {
 		return nil, false, errors.New("circuit breaker id cannot be empty")
@@ -236,6 +416,7 @@ func (m *Manager) getOrCreate(ctx context.Context, id string) (*core.CircuitBrea
 	return candidate, created, nil
 }
 
+// loadOrCreate loads snapshot and reconstructs breaker or creates a new one.
 func (m *Manager) loadOrCreate(ctx context.Context, id string) (*core.CircuitBreaker, bool, error) {
 	if m.store != nil {
 		snapshot, err := m.store.Load(ctx, id)
@@ -271,5 +452,61 @@ func shouldSave(policy PersistPolicy, created bool, before, after core.State) bo
 		return true
 	default:
 		return created || before != after
+	}
+}
+
+func classifyOutcome(err error) Outcome {
+	switch {
+	case err == nil:
+		return OutcomeSuccess
+	case errors.Is(err, core.ErrCircuitOpen):
+		return OutcomeBlockedOpen
+	case errors.Is(err, context.Canceled):
+		return OutcomeCanceled
+	case errors.Is(err, context.DeadlineExceeded):
+		return OutcomeDeadlineExceeded
+	default:
+		return OutcomeFailure
+	}
+}
+
+func classifyExecutionOutcome(parentCtx, execCtx context.Context, err error) Outcome {
+	if err == nil {
+		return OutcomeSuccess
+	}
+	if errors.Is(err, core.ErrCircuitOpen) {
+		return OutcomeBlockedOpen
+	}
+	if errors.Is(err, context.Canceled) {
+		return OutcomeCanceled
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		if parentCtx != nil && parentCtx.Err() == nil && execCtx != nil && errors.Is(execCtx.Err(), context.DeadlineExceeded) {
+			return OutcomeTimeout
+		}
+		return OutcomeDeadlineExceeded
+	}
+	return OutcomeFailure
+}
+
+func (m *Manager) emit(ctx context.Context, event Event) {
+	if len(m.observers) == 0 {
+		return
+	}
+
+	for idx, observer := range m.observers {
+		func(index int, o Observer) {
+			// Observers are synchronous by design. We recover panics so hooks cannot break breaker flow.
+			defer func() {
+				if r := recover(); r != nil && m.observerErrHandler != nil {
+					m.observerErrHandler(&ObserverError{
+						ObserverIndex: index,
+						EventType:     event.Type,
+						Cause:         fmt.Errorf("panic: %v", r),
+					})
+				}
+			}()
+			o.OnCircuitBreakerEvent(ctx, event)
+		}(idx, observer)
 	}
 }

@@ -1,0 +1,26 @@
+groups:
+  - name: go-circuit-breaker
+    interval: 30s
+    rules:
+      - alert: CircuitBreakerBlockedOpenSpike
+        expr: |
+          sum by (breaker_id) (
+            rate(gcb_circuit_breaker_executions_total{outcome="blocked_open"}[5m])
+          ) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Circuit breaker blocked-open spike for {{ $labels.breaker_id }}"
+          description: "The blocked_open rate has stayed above 1 req/s for 5 minutes."
+
+      - alert: CircuitBreakerOpenTooLong
+        expr: |
+          max_over_time(gcb_circuit_breaker_state{state="OPEN"}[10m]) == 1
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Circuit breaker stuck OPEN for {{ $labels.breaker_id }}"
+          description: "Breaker state has remained OPEN continuously for at least 10 minutes."
+

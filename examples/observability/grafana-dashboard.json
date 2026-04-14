@@ -1,0 +1,119 @@
+{
+  "title": "Go Circuit Breaker",
+  "tags": [
+    "go",
+    "circuit-breaker",
+    "prometheus"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "templating": {
+    "list": [
+      {
+        "name": "breaker_id",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": "label_values(gcb_circuit_breaker_state, breaker_id)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Execution Outcomes (req/s)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (breaker_id, outcome) (rate(gcb_circuit_breaker_executions_total{breaker_id=~\"$breaker_id\"}[5m]))",
+          "legendFormat": "{{breaker_id}} / {{outcome}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "id": 2,
+      "title": "Current State (1 means active)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "gcb_circuit_breaker_state{breaker_id=~\"$breaker_id\"}",
+          "legendFormat": "{{breaker_id}} / {{state}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      }
+    },
+    {
+      "id": 3,
+      "title": "Blocked Open Rate (req/s)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (breaker_id) (rate(gcb_circuit_breaker_executions_total{breaker_id=~\"$breaker_id\",outcome=\"blocked_open\"}[5m]))",
+          "legendFormat": "{{breaker_id}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      }
+    },
+    {
+      "id": 4,
+      "title": "Event Throughput (events/s)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (breaker_id, event_type) (rate(gcb_circuit_breaker_events_total{breaker_id=~\"$breaker_id\"}[5m]))",
+          "legendFormat": "{{breaker_id}} / {{event_type}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      }
+    }
+  ]
+}
+

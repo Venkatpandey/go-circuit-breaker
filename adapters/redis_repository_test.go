@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"go-circuit-breaker/core"
+	"github.com/Venkatpandey/go-circuit-breaker/core"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/go-redis/redis/v8"
