@@ -20,6 +20,33 @@ The project ships one runnable demo under `cmd/http-demo` and keeps Redis out of
 - 🧪 Unit, race, integration, and benchmark workflows.
 - 📚 GoDoc-friendly exported API comments and package docs.
 
+## Public stability contract (v1)
+
+Starting with `v1.0.0`, this project follows strict SemVer:
+
+- Exported Go APIs in `core`, `service`, and `observability/prometheus` are stable across v1 minors/patches.
+- Event type names and event payload semantics are stable across v1 minors/patches.
+- Prometheus metric names and label keys are stable across v1 minors/patches.
+
+Breaking changes are reserved for a future `v2.0.0`.
+
+### Go version support policy
+
+For every v1 release, we support:
+
+- the current stable Go release
+- the previous stable Go release
+
+CI runs this repository against that two-version matrix.
+
+### Deprecation policy
+
+- Deprecated APIs are kept for at least one minor release before removal.
+- Every deprecation includes:
+  - replacement guidance
+  - migration notes
+  - changelog entry
+
 ## Why local-first
 
 The primary production model is one breaker per process protecting the dependency that process calls.
@@ -292,6 +319,14 @@ pkgsite
 
 Then open `http://localhost:8080/github.com/Venkatpandey/go-circuit-breaker`.
 
+## Migration note (pre-v1 to v1)
+
+If you used pre-v1 commits:
+
+- module path is now `github.com/Venkatpandey/go-circuit-breaker`
+- import paths should use the GitHub module path
+- event hooks and Prometheus observer are now part of the stable v1 contract
+
 Optional Redis workflows:
 
 ```bash
@@ -347,10 +382,13 @@ These numbers are intended as a reference point for the in-memory hot path. Actu
 - `make test-race`: race detector across the default test suite
 - `make test-integration`: Redis adapter tests behind the `integration` build tag
 - `make benchmark`: local microbenchmarks for the core and manager hot paths
+- `make vuln`: dependency and symbol vulnerability scan (requires a patched Go toolchain; stdlib findings can indicate you need a newer Go patch release)
 
 ## Open source basics
 
 - License: MIT, see `LICENSE`
 - Contribution notes: see `CONTRIBUTING.md`
+- Changelog: see `CHANGELOG.md`
+- Release process: see `RELEASING.md`
 - CI: see `.github/workflows/ci.yml`
 - Documentation style: exported APIs should include GoDoc comments and long files should use lightweight section headers.
