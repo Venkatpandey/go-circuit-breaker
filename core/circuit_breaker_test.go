@@ -205,7 +205,15 @@ func TestSnapshotRoundTrip(t *testing.T) {
 }
 
 func TestConcurrency(t *testing.T) {
-	cb := createTestBreaker(t)
+	cb, err := NewCircuitBreaker(Config{
+		FailureThreshold: 1000,
+		SuccessThreshold: 2,
+		CooldownPeriod:   40 * time.Millisecond,
+		RequestTimeout:   25 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("create breaker: %v", err)
+	}
 
 	var successes int64
 	var failures int64
