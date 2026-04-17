@@ -8,7 +8,7 @@ GOTMP_DIR := $(CURDIR)/.gotmp
 GOENV := GOCACHE=$(GOCACHE_DIR) GOTMPDIR=$(GOTMP_DIR)
 REDIS_PORT := 6379
 
-.PHONY: build test test-race test-integration benchmark demo clean docker-up docker-down help ci
+.PHONY: build test test-race test-integration vet lint vuln benchmark demo clean docker-up docker-down help ci
 
 help:
 	@echo "Available targets:"
@@ -16,6 +16,9 @@ help:
 	@echo "  test              Run the default unit test suite"
 	@echo "  test-race         Run tests with the race detector"
 	@echo "  test-integration  Run Redis adapter integration tests"
+	@echo "  vet               Run go vet"
+	@echo "  lint              Run static analysis (staticcheck)"
+	@echo "  vuln              Run vulnerability scan (govulncheck)"
 	@echo "  benchmark         Run the local benchmark suite"
 	@echo "  demo              Run the HTTP demo"
 	@echo "  docker-up         Start local Redis via docker-compose"
@@ -38,6 +41,15 @@ test-race: $(GOCACHE_DIR) $(GOTMP_DIR)
 test-integration: $(GOCACHE_DIR) $(GOTMP_DIR)
 	env $(GOENV) $(GO) test $(GOFLAGS) -tags=integration ./...
 
+vet: $(GOCACHE_DIR) $(GOTMP_DIR)
+	env $(GOENV) $(GO) vet $(GOFLAGS) ./...
+
+lint: $(GOCACHE_DIR) $(GOTMP_DIR)
+	env $(GOENV) $(GO) run honnef.co/go/tools/cmd/staticcheck@latest ./...
+
+vuln: $(GOCACHE_DIR) $(GOTMP_DIR)
+	env $(GOENV) $(GO) run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
 benchmark: $(GOCACHE_DIR) $(GOTMP_DIR)
 	env $(GOENV) $(GO) test $(GOFLAGS) -run=^$$ -bench=. -benchmem ./core ./service
 
@@ -53,4 +65,4 @@ docker-down:
 clean:
 	rm -rf $(BIN_DIR) .gocache .gotmp coverage.out
 
-ci: test test-race test-integration build
+ci: test test-race test-integration vet lint vuln build
